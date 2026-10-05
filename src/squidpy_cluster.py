@@ -193,7 +193,8 @@ def main():
     parser.add_argument("--n-pcs", type=int, default=30)
     parser.add_argument("--n-neighbors", type=int, default=15)
     parser.add_argument("--resolution", type=float, default=1.0)
-    parser.add_argument("--batch-key", default="sample_id")
+    parser.add_argument("--batch-key", nargs="+", default=["sample_id"],
+                        help="obs column(s) Harmony integrates on, space-separated")
     parser.add_argument("--hvg-batch-key", default=None,
                         help="batch key for highly_variable_genes; omit to select over "
                              "the whole object, which keeps near-empty sections from "

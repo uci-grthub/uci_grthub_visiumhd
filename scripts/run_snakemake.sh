@@ -18,7 +18,8 @@
 
 set -euo pipefail
 
+# conda stays on PATH for rules with a conda: directive; snakemake itself is the
+# pixi global install in $HOME, which starts in seconds instead of minutes on /dfs9
 source /opt/apps/mamba/24.3.0/etc/profile.d/conda.sh
-conda activate snakemake_dfs
 
-snakemake --profile slurm --rerun-incomplete "$@"
+"$HOME/.pixi/bin/snakemake" --profile slurm --rerun-incomplete "$@"

@@ -833,7 +833,8 @@ rule squidpy_cluster:
         n_pcs = SQUIDPY.get("cluster", {}).get("n_pcs", 30),
         n_neighbors = squidpy_cluster_setting("n_neighbors", 15),
         resolution = squidpy_cluster_setting("resolution", 1.0),
-        batch_key = SQUIDPY.get("cluster", {}).get("batch_key", "sample_id"),
+        batch_key = (lambda k: " ".join(k) if isinstance(k, list) else k)(
+            SQUIDPY.get("cluster", {}).get("batch_key", "sample_id")),
         hvg_batch = (lambda k: f"--hvg-batch-key {k}" if k else "")(
             SQUIDPY.get("cluster", {}).get("hvg_batch_key")),
         theta = SQUIDPY.get("cluster", {}).get("harmony_theta", 2.0),

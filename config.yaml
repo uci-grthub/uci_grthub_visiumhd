@@ -172,12 +172,14 @@ squidpy:
     resolution_per_level: {}
     # one batch per biological sample, <patient_id>_<condition>_W<timepoint>: 22 levels
     # against 24 cores, because the two A1_TMA6 cores of each condition are technical
-    # replicates of one sample and share a batch. Every batch is a single condition x
-    # timepoint, so Harmony also pulls the conditions together -- read
-    # qc/cluster_by_condition.csv, and compare against use_harmony: false, before
+    # replicates of one sample and share a batch. patient_id is a second batch variable:
+    # each patient occupies exactly one capture area, so it additionally corrects the
+    # between-patient/between-section component of variation. Every sample_id batch is a
+    # single condition x timepoint, so Harmony also pulls the conditions together --
+    # read qc/cluster_by_condition.csv, and compare against use_harmony: false, before
     # trusting condition-specific clusters. Expression-level DE is unaffected: Harmony
     # only rewrites the embedding.
-    batch_key: "sample_id"
+    batch_key: ["sample_id", "patient_id"]
     harmony_theta: 2.0    # lower corrects more gently
     # Select HVGs over the whole object rather than per batch: with near-empty sections
     # in the mix, per-batch selection lets them contribute noise genes to the 2000.

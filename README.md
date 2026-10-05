@@ -22,12 +22,21 @@ Tissue: six TMAs of 2 mm human skin biopsies, two capture areas per Visium HD
 
 ## Running
 
-Snakemake lives in a conda environment, not a module:
+Snakemake is a pixi global install in the home directory, not a module or a
+conda environment:
 
 ```bash
-source /opt/apps/mamba/24.3.0/etc/profile.d/conda.sh
-conda activate snakemake_dfs
+PIXI_CACHE_DIR=$HOME/.cache/pixi pixi global install -c conda-forge -c bioconda \
+  --environment snakemake snakemake=9.13.7 \
+  --with snakemake-executor-plugin-cluster-generic --with pandas
 ```
+
+This exposes `snakemake` in `~/.pixi/bin`. Keep the install off `/dfs9`: from a
+conda env on BeeGFS, Snakemake takes 1–3 min just to import, and a dry run
+takes over 3 min; from home it takes a few seconds. Do not `conda activate
+snakemake_dfs` first, or its slower `snakemake` shadows this one. Rules with a
+`conda:` directive still need `conda` on `PATH`
+(`/opt/apps/mamba/24.3.0/condabin`).
 
 Dry run first. It prints the discovered capture areas and warns about anything
 it could not resolve — read those before submitting:
@@ -184,18 +193,19 @@ runnable without the manual annotation step below.
 the patient — one variable with six levels — while `condition` and `timepoint_weeks`
 vary *within* each capture area.
 
-Harmony runs with one batch per **biological sample**: `squidpy.cluster.batch_key:
-sample_id`, built in `src/squidpy_make_adata.py` as
-`<patient_id>_<condition>_W<timepoint_weeks>`. That is 22 levels against the
-experiment's 24 cores, because the two `A1_TMA6` cores of each condition are technical
-replicates of the same patient 12 W0 sample and share a `sample_id`. Harmony is
-therefore not asked to remove the difference between two sections of one sample — the
-only purely technical variation in this design, and the one thing worth being able to
-see. It is the same unit `src/squidpy_de.py` pseudobulks on (`de.sample_key:
-core_index`).
+Harmony runs with two batch variables: `squidpy.cluster.batch_key: [sample_id,
+patient_id]`. `sample_id` is one batch per **biological sample**, built in
+`src/squidpy_make_adata.py` as `<patient_id>_<condition>_W<timepoint_weeks>`. That is
+22 levels against the experiment's 24 cores, because the two `A1_TMA6` cores of each
+condition are technical replicates of the same patient 12 W0 sample and share a
+`sample_id`. `patient_id` adds one batch per **patient** on top; since each patient
+occupies exactly one capture area, it also corrects the between-section component of
+variation on top of the between-sample one. It is the same unit `src/squidpy_de.py`
+pseudobulks on (`de.sample_key: core_index`).
 
-The cost is not small. Every batch is a single condition × timepoint, so `condition` and
-`timepoint_weeks` are perfectly nested inside the batch key, and Harmony attenuates
+The cost is not small. Every `sample_id` batch is a single condition × timepoint, so
+`condition` and `timepoint_weeks` are perfectly nested inside the batch keys, and
+`patient_id` flattens the remaining between-patient structure: Harmony attenuates
 genuine normal-vs-pigmented and W0-vs-W16 composition differences along with the
 technical ones. Three things keep that visible:
 
@@ -462,7 +472,7 @@ a few hundred microns.
   ```
   This manifest is deliberately separate from the workspace `pixi.toml`, whose
   PyPI dependencies fail to solve on this cluster.
-- Snakemake 9 with the `cluster-generic` executor plugin (conda env `snakemake_dfs`).
+- Snakemake 9 with the `cluster-generic` executor plugin (pixi global env `snakemake`; see [Running](#running)).
 - For the downstream spatial rules: pixi (0.65 tested) and the `envs/squidpy`
   environment — see [Prerequisites](#prerequisites). Every such rule exports
   `PYTHONNOUSERSITE=1`.
