@@ -2,19 +2,23 @@
 """
 Normalise, integrate across capture areas and cluster the combined Visium HD object.
 
-Batch correction is Harmony on two batch variables, ``sample_id`` and ``patient_id``:
-one batch per biological sample (22 of them against the experiment's 24 TMA cores --
-the two ``A1_TMA6`` cores of each condition are technical replicates of the same
-patient 12 W0 sample and share a ``sample_id``) and, on top, one batch per patient.
-``sample_id`` is built in ``src/squidpy_make_adata.py`` as
-``<patient_id>_<condition>_W<timepoint_weeks>``. Because every patient occupies exactly
-one capture area, the ``patient_id`` correction is also a capture-area correction:
-it removes the between-patient/between-section component of variation on top of the
-between-sample component.
+Batch correction is Harmony on one batch key per run. The pipeline runs this
+script once per key in squidpy.cluster.batch_keys (config.yaml) and writes one
+clustered object per key, so the corrections are applied and inspected
+separately rather than jointly; ``--batch-key`` still accepts several columns
+for a joint correction, but the pipeline does not use that. ``sample_id`` is
+one batch per biological sample (22 of them against the experiment's 24 TMA
+cores -- the two ``A1_TMA6`` cores of each condition are technical replicates
+of the same patient 12 W0 sample and share a ``sample_id``), built in
+``src/squidpy_make_adata.py`` as ``<patient_id>_<condition>_W<timepoint_weeks>``.
+``patient_id`` is one batch per patient; because every patient occupies exactly
+one capture area, that run corrects the between-patient/between-section
+component of variation on top of what the sample-level run corrects.
 
 The cost, which is not small: every ``sample_id`` batch is a single condition x
 timepoint, so ``condition`` and ``timepoint_weeks`` are perfectly nested inside the
-batch keys, and adding ``patient_id`` flattens the remaining between-patient structure.
+batch keys, and the ``patient_id`` run flattens the remaining between-patient
+structure.
 Harmony aligns cluster composition across batches, so it attenuates genuine
 normal-vs-pigmented and W0-vs-W16 composition differences along with the technical
 ones. Three things make that visible rather than assumed away:

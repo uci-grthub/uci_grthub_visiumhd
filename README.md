@@ -38,6 +38,15 @@ snakemake_dfs` first, or its slower `snakemake` shadows this one. Rules with a
 `conda:` directive still need `conda` on `PATH`
 (`/opt/apps/mamba/24.3.0/condabin`).
 
+The workspace `pixi.toml` has a `snakemake` task that forwards to that global
+install, so every `snakemake ...` command below can be run from the repo root
+as `pixi run snakemake ...` without typing the home path. It is a task, not a
+dependency, on purpose: a workspace env on `/dfs9` imports snakemake slowly
+(above). `pixi run` at the root also required moving the squidpy-dfs stack out
+of the workspace manifest, into `envs/squidpy-dfs/pixi.toml`: its PyPI
+dependencies need the conda-to-PyPI mapping, which cannot be fetched on this
+network, and one un-lockable environment blocks every `pixi run` task.
+
 Dry run first. It prints the discovered capture areas and warns about anything
 it could not resolve — read those before submitting:
 
@@ -193,21 +202,33 @@ runnable without the manual annotation step below.
 the patient — one variable with six levels — while `condition` and `timepoint_weeks`
 vary *within* each capture area.
 
-Harmony runs with two batch variables: `squidpy.cluster.batch_key: [sample_id,
-patient_id]`. `sample_id` is one batch per **biological sample**, built in
+Harmony runs **once per key in `squidpy.cluster.batch_keys`**, one clustered object
+per key, so the corrections are applied and compared separately rather than jointly.
+`sample_id` is one batch per **biological sample**, built in
 `src/squidpy_make_adata.py` as `<patient_id>_<condition>_W<timepoint_weeks>`. That is
 22 levels against the experiment's 24 cores, because the two `A1_TMA6` cores of each
 condition are technical replicates of the same patient 12 W0 sample and share a
-`sample_id`. `patient_id` adds one batch per **patient** on top; since each patient
-occupies exactly one capture area, it also corrects the between-section component of
-variation on top of the between-sample one. It is the same unit `src/squidpy_de.py`
+`sample_id`. `patient_id` is one batch per **patient**; since each patient
+occupies exactly one capture area, that run also corrects the between-section
+component of variation on top of the between-sample one. The key named by
+`squidpy.cluster.primary_batch_key` keeps the canonical output names every
+downstream rule consumes (`clustered.h5ad`, `markers.csv`, `qc/`, `figures/`);
+every other key writes suffixed siblings next to them
+(`clustered_patient_id.h5ad`, `markers_patient_id.csv`, `qc_patient_id/`,
+`figures_patient_id/`). The cheap downstream stages also run per key:
+neighbourhood enrichment, interaction matrix, centrality and co-occurrence
+(`spatial_stats_<key>/`), and pseudobulk DE (`de_<key>/<comparison>/`, whose
+per-cluster tables follow that key's clusters; whole-core tables are
+clustering-independent). The per-sample stages — spatially variable genes,
+spatial expression panels, cell-cell communication, image features — run on
+the primary object only. `sample_id` is also the unit `src/squidpy_de.py`
 pseudobulks on (`de.sample_key: core_index`).
 
 The cost is not small. Every `sample_id` batch is a single condition × timepoint, so
 `condition` and `timepoint_weeks` are perfectly nested inside the batch keys, and
-`patient_id` flattens the remaining between-patient structure: Harmony attenuates
-genuine normal-vs-pigmented and W0-vs-W16 composition differences along with the
-technical ones. Three things keep that visible:
+the `patient_id` run flattens the remaining between-patient structure: Harmony
+attenuates genuine normal-vs-pigmented and W0-vs-W16 composition differences along
+with the technical ones. Three things keep that visible:
 
 - Harmony only rewrites the PCA embedding. `rank_genes_groups` and the pyDESeq2
   pseudobulk path read `.raw` / `layers["counts"]`, so **expression-level DE is
@@ -442,17 +463,26 @@ liana 1.10) but the workflow no longer uses it.
 Intermediates in `output/squidpy/square_<bin>um/`, tables and figures in
 `results/squidpy/square_<bin>um/`:
 
-- `per_sample/<run_id>.h5ad`, `combined.h5ad`, `clustered.h5ad`, `spatial_stats.h5ad`
+- `per_sample/<run_id>.h5ad`, `combined.h5ad`, `clustered.h5ad`, `spatial_stats.h5ad`;
+  every non-primary `squidpy.cluster.batch_keys` entry also writes
+  `clustered_<key>.h5ad` there
 - `qc/<run_id>_core_assignment.pdf`, `qc/bins_per_core.csv`, `qc/qc_violin.pdf`,
   `qc/qc_per_section.pdf`, `qc/section_depth.pdf`, `qc/section_qc.csv`,
-  `qc/quantile_bounds.csv`, `qc/cluster_by_<annotation>.csv`
-- `markers.csv`, `figures/umap_*.pdf`
+  `qc/quantile_bounds.csv`, `qc/cluster_by_<annotation>.csv`; each non-primary
+  batch key writes the same cluster-composition tables under `qc_<key>/`
+- `markers.csv`, `figures/umap_*.pdf`, and `markers_<key>.csv`,
+  `figures_<key>/umap_*.pdf` per non-primary batch key
 - `nhood_enrichment_zscore.csv`, `interaction_matrix.csv`, `centrality_scores.csv`,
-  `cooccurrence_<group>_<level>.csv`
+  `cooccurrence_<group>_<level>.csv`; each non-primary batch key writes the same
+  four under `spatial_stats_<key>/`, plus `spatial_stats_<key>.h5ad` next to
+  `spatial_stats.h5ad`
 - `svg/<run_id>_spatial_autocorr.csv`, `spatial/<run_id>_panels.pdf`
 - `ccc/<condition>_liana_cellchat.csv`, `ccc/<condition>_dotplot.pdf`
 - `image_features/<run_id>.csv`
-- `de/<comparison>/whole_core.csv`, `per_cluster.csv`, `samples.csv`, `volcano.pdf`
+- `de/<comparison>/whole_core.csv`, `per_cluster.csv`, `samples.csv`, `volcano.pdf`;
+  each non-primary batch key writes the same tables under
+  `de_<key>/<comparison>/` (whole-core ones clustering-independent,
+  `per_cluster.csv` follows that key's clusters)
 
 `src/explain_co-occurence.md` explains how to read the co-occurrence score. Co-occurrence
 radii are set in microns (`squidpy.cooccurrence.max_radius_um`, default 500) rather than

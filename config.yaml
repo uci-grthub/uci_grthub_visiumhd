@@ -170,16 +170,26 @@ squidpy:
     n_neighbors_per_level:
       square_008um: 100
     resolution_per_level: {}
-    # one batch per biological sample, <patient_id>_<condition>_W<timepoint>: 22 levels
-    # against 24 cores, because the two A1_TMA6 cores of each condition are technical
-    # replicates of one sample and share a batch. patient_id is a second batch variable:
-    # each patient occupies exactly one capture area, so it additionally corrects the
-    # between-patient/between-section component of variation. Every sample_id batch is a
-    # single condition x timepoint, so Harmony also pulls the conditions together --
-    # read qc/cluster_by_condition.csv, and compare against use_harmony: false, before
-    # trusting condition-specific clusters. Expression-level DE is unaffected: Harmony
+    # Harmony runs once per key in batch_keys, writing one clustered object per
+    # key, so the corrections are applied and compared separately rather than
+    # jointly. sample_id is one batch per biological sample,
+    # <patient_id>_<condition>_W<timepoint>: 22 levels against 24 cores, because
+    # the two A1_TMA6 cores of each condition are technical replicates of one
+    # sample and share a batch. patient_id is one batch per patient; because
+    # each patient occupies exactly one capture area, that run corrects the
+    # between-patient/between-section component of variation on top of what
+    # sample_id corrects. Every sample_id batch is a single condition x
+    # timepoint, so either run of Harmony also pulls the conditions together --
+    # read qc*/cluster_by_condition.csv, and compare the two integrations
+    # against each other and against use_harmony: false, before trusting
+    # condition-specific clusters. Expression-level DE is unaffected: Harmony
     # only rewrites the embedding.
-    batch_key: ["sample_id", "patient_id"]
+    # The primary key's outputs keep the canonical names every downstream rule
+    # consumes (clustered.h5ad, markers.csv, qc/, figures/); every other key
+    # gets a _<key> suffix (clustered_patient_id.h5ad, markers_patient_id.csv,
+    # qc_patient_id/, figures_patient_id/).
+    batch_keys: ["sample_id", "patient_id"]
+    primary_batch_key: "sample_id"
     harmony_theta: 2.0    # lower corrects more gently
     # Select HVGs over the whole object rather than per batch: with near-empty sections
     # in the mix, per-batch selection lets them contribute noise genes to the 2000.

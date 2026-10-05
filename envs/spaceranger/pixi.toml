@@ -6,7 +6,7 @@
 #
 # Kept as a standalone manifest rather than a feature of the workspace
 # pixi.toml so that solving it does not require the conda-to-PyPI mapping
-# needed by the squidpy-dfs PyPI dependencies.
+# that envs/squidpy-dfs/pixi.toml needs and this network cannot fetch.
 #
 # Usage:
 #   pixi run --manifest-path envs/spaceranger/pixi.toml spaceranger count ...

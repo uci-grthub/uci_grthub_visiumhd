@@ -819,7 +819,16 @@ def squidpy_subsample_flag(wildcards):
     return ""
 
 
-# Rule: normalise, Harmony-integrate on squidpy.cluster.batch_key, and cluster
+#: one Harmony run per key: the primary key keeps the canonical output names every
+#: downstream rule consumes; every other key writes clustered_<key>.h5ad next to them
+BATCH_KEYS = SQUIDPY.get("cluster", {}).get("batch_keys", ["sample_id"])
+PRIMARY_BATCH_KEY = SQUIDPY.get("cluster", {}).get(
+    "primary_batch_key", BATCH_KEYS[0])
+ALT_BATCH_KEYS = [k for k in BATCH_KEYS if k != PRIMARY_BATCH_KEY]
+
+
+# Rule: normalise, Harmony-integrate on the primary key of
+# squidpy.cluster.batch_keys, and cluster
 rule squidpy_cluster:
     input:
         script = "src/squidpy_cluster.py",
@@ -833,8 +842,7 @@ rule squidpy_cluster:
         n_pcs = SQUIDPY.get("cluster", {}).get("n_pcs", 30),
         n_neighbors = squidpy_cluster_setting("n_neighbors", 15),
         resolution = squidpy_cluster_setting("resolution", 1.0),
-        batch_key = (lambda k: " ".join(k) if isinstance(k, list) else k)(
-            SQUIDPY.get("cluster", {}).get("batch_key", "sample_id")),
+        batch_key = PRIMARY_BATCH_KEY,
         hvg_batch = (lambda k: f"--hvg-batch-key {k}" if k else "")(
             SQUIDPY.get("cluster", {}).get("hvg_batch_key")),
         theta = SQUIDPY.get("cluster", {}).get("harmony_theta", 2.0),
@@ -851,6 +859,61 @@ rule squidpy_cluster:
         account = squidpy_account()
     log:
         f"{OUTPUT_DIR}/logs/squidpy_cluster_{{level}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        {SQUIDPY_PYTHON} {input.script} \
+            --input {input.combined} \
+            --output {output.clustered} \
+            --figure-dir {params.figure_dir} \
+            --markers-csv {output.markers} \
+            --n-top-genes {params.n_top_genes} \
+            --n-pcs {params.n_pcs} \
+            --n-neighbors {params.n_neighbors} \
+            --resolution {params.resolution} \
+            --batch-key {params.batch_key} \
+            {params.hvg_batch} \
+            --theta {params.theta} \
+            --crosstab-dir {params.crosstab_dir} \
+            --cluster-key {params.cluster_key} \
+            {params.harmony} {params.subsample} > {log} 2>&1
+        """
+
+
+# Rule: the same normalise-and-cluster once per every other key in
+# squidpy.cluster.batch_keys, each to its own object rather than a joint
+# correction, so the corrections can be compared (qc_<key>/cluster_by_* tables
+# against the primary's qc/ ones)
+rule squidpy_cluster_alt:
+    input:
+        script = "src/squidpy_cluster.py",
+        combined = f"{SQUIDPY_DIR}/{{level}}/combined.h5ad"
+    output:
+        clustered = f"{SQUIDPY_DIR}/{{level}}/clustered_{{batch_key}}.h5ad",
+        markers = f"{SQUIDPY_RESULTS}/{{level}}/markers_{{batch_key}}.csv"
+    params:
+        figure_dir = f"{SQUIDPY_RESULTS}/{{level}}/figures_{{batch_key}}",
+        n_top_genes = SQUIDPY.get("cluster", {}).get("n_top_genes", 2000),
+        n_pcs = SQUIDPY.get("cluster", {}).get("n_pcs", 30),
+        n_neighbors = squidpy_cluster_setting("n_neighbors", 15),
+        resolution = squidpy_cluster_setting("resolution", 1.0),
+        batch_key = lambda wildcards: wildcards.batch_key,
+        hvg_batch = (lambda k: f"--hvg-batch-key {k}" if k else "")(
+            SQUIDPY.get("cluster", {}).get("hvg_batch_key")),
+        theta = SQUIDPY.get("cluster", {}).get("harmony_theta", 2.0),
+        crosstab_dir = f"{SQUIDPY_RESULTS}/{{level}}/qc_{{batch_key}}",
+        cluster_key = SQUIDPY.get("cluster", {}).get("cluster_key", "leiden"),
+        harmony = "" if SQUIDPY.get("cluster", {}).get("use_harmony", True) else "--no-harmony",
+        subsample = squidpy_subsample_flag
+    threads: squidpy_cluster_resource("cpus", 8)
+    resources:
+        mem_mb = squidpy_cluster_resource("mem_mb", 128000),
+        cpus = squidpy_cluster_resource("cpus", 8),
+        runtime = squidpy_cluster_resource("runtime", 480),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_cluster_{{level}}_{{batch_key}}.log"
     shell:
         """
         export PYTHONNOUSERSITE=1
@@ -905,6 +968,66 @@ rule squidpy_spatial_stats:
         account = squidpy_account()
     log:
         f"{OUTPUT_DIR}/logs/squidpy_spatial_stats_{{level}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        {SQUIDPY_PYTHON} {input.script} \
+            --input {input.clustered} \
+            --output {output.stats} \
+            --results-dir {params.results_dir} \
+            --figure-dir {params.figure_dir} \
+            --cluster-key {params.cluster_key} \
+            --library-key {params.library_key} \
+            --coord-type {params.coord_type} \
+            --n-neighs {params.n_neighs} \
+            --n-rings {params.n_rings} \
+            --n-perms {params.n_perms} \
+            --cooccurrence-interval {params.interval} \
+            --cooccurrence-max-radius-um {params.max_radius_um} \
+            --cooccurrence-splits {params.n_splits} \
+            --max-bins-per-group {params.max_bins} \
+            --group-keys {params.group_keys} \
+            --n-jobs {threads} > {log} 2>&1
+        """
+
+
+# Rule: the same neighbourhood enrichment, interaction matrix, centrality and
+# co-occurrence, on every other batch key's clustered object. The script writes
+# fixed file names into --results-dir and --figure-dir, so the directories carry
+# the _<key> suffix; figures_<key> is shared with squidpy_cluster_alt, mirroring
+# how the canonical rules share figures/
+rule squidpy_spatial_stats_alt:
+    input:
+        script = "src/squidpy_spatial_stats.py",
+        clustered = f"{SQUIDPY_DIR}/{{level}}/clustered_{{batch_key}}.h5ad"
+    output:
+        stats = f"{SQUIDPY_DIR}/{{level}}/spatial_stats_{{batch_key}}.h5ad",
+        nhood = f"{SQUIDPY_RESULTS}/{{level}}/spatial_stats_{{batch_key}}/nhood_enrichment_zscore.csv",
+        interactions = f"{SQUIDPY_RESULTS}/{{level}}/spatial_stats_{{batch_key}}/interaction_matrix.csv",
+        centrality = f"{SQUIDPY_RESULTS}/{{level}}/spatial_stats_{{batch_key}}/centrality_scores.csv"
+    params:
+        results_dir = f"{SQUIDPY_RESULTS}/{{level}}/spatial_stats_{{batch_key}}",
+        figure_dir = f"{SQUIDPY_RESULTS}/{{level}}/figures_{{batch_key}}",
+        cluster_key = SQUIDPY.get("cluster", {}).get("cluster_key", "leiden"),
+        library_key = LIBRARY_KEY,
+        coord_type = spatial_param("coord_type", "grid"),
+        n_neighs = spatial_param("n_neighs", 8),
+        n_rings = spatial_param("n_rings", 1),
+        n_perms = SQUIDPY.get("spatial", {}).get("n_perms", 1000),
+        group_keys = " ".join(SQUIDPY.get("spatial", {}).get("group_keys", ["condition"])),
+        interval = SQUIDPY.get("cooccurrence", {}).get("interval", 50),
+        max_radius_um = SQUIDPY.get("cooccurrence", {}).get("max_radius_um", 500),
+        n_splits = SQUIDPY.get("cooccurrence", {}).get("n_splits", 20),
+        max_bins = SQUIDPY.get("cooccurrence", {}).get("max_bins_per_group", 50000)
+    threads: squidpy_resource("spatial_stats", "cpus", 16)
+    resources:
+        mem_mb = squidpy_resource("spatial_stats", "mem_mb", 192000),
+        cpus = squidpy_resource("spatial_stats", "cpus", 16),
+        runtime = squidpy_resource("spatial_stats", "runtime", 720),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_spatial_stats_{{level}}_{{batch_key}}.log"
     shell:
         """
         export PYTHONNOUSERSITE=1
@@ -1158,6 +1281,58 @@ rule squidpy_de:
         """
 
 
+# Rule: the same pseudobulk DE for every other batch key's clusters: counts
+# always come from combined.h5ad, the leiden labels from that key's clustered
+# object, so the per_cluster tables differ between integrations
+rule squidpy_de_alt:
+    input:
+        script = "src/squidpy_de.py",
+        combined = f"{SQUIDPY_DIR}/{{level}}/combined.h5ad",
+        clustered = f"{SQUIDPY_DIR}/{{level}}/clustered_{{batch_key}}.h5ad",
+        sample_metadata = SAMPLE_METADATA
+    output:
+        whole_core = f"{SQUIDPY_RESULTS}/{{level}}/de_{{batch_key}}/{{comparison}}/whole_core.csv",
+        per_cluster = f"{SQUIDPY_RESULTS}/{{level}}/de_{{batch_key}}/{{comparison}}/per_cluster.csv",
+        samples = f"{SQUIDPY_RESULTS}/{{level}}/de_{{batch_key}}/{{comparison}}/samples.csv",
+        volcano = f"{SQUIDPY_RESULTS}/{{level}}/de_{{batch_key}}/{{comparison}}/volcano.pdf"
+    params:
+        outdir = f"{SQUIDPY_RESULTS}/{{level}}/de_{{batch_key}}/{{comparison}}",
+        comparison = lambda wildcards: json.dumps(DE_COMPARISONS[wildcards.comparison]),
+        sample_key = SQUIDPY_DE.get("sample_key", "core_index"),
+        cluster_key = SQUIDPY_DE.get("cluster_key", "leiden"),
+        min_obs = SQUIDPY_DE.get("min_obs_per_pseudobulk", 50),
+        min_samples = SQUIDPY_DE.get("min_samples_per_group", 2),
+        min_gene_counts = SQUIDPY_DE.get("min_gene_counts", 10),
+        alpha = SQUIDPY_DE.get("alpha", 0.05)
+    threads: squidpy_resource("de", "cpus", 4)
+    resources:
+        mem_mb = squidpy_resource("de", "mem_mb", 32000),
+        cpus = squidpy_resource("de", "cpus", 4),
+        runtime = squidpy_resource("de", "runtime", 120),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_de_{{comparison}}_{{level}}_{{batch_key}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        {SQUIDPY_PYTHON} {input.script} \
+            --counts {input.combined} \
+            --clustered {input.clustered} \
+            --sample-metadata {input.sample_metadata} \
+            --name {wildcards.comparison} \
+            --comparison '{params.comparison}' \
+            --outdir {params.outdir} \
+            --sample-key {params.sample_key} \
+            --cluster-key {params.cluster_key} \
+            --min-obs-per-pseudobulk {params.min_obs} \
+            --min-samples-per-group {params.min_samples} \
+            --min-gene-counts {params.min_gene_counts} \
+            --alpha {params.alpha} \
+            --n-jobs {threads} > {log} 2>&1
+        """
+
+
 # Target rule: every DE comparison at every DE level
 rule squidpy_de_all:
     input:
@@ -1169,6 +1344,8 @@ rule squidpy_de_all:
 rule squidpy_all:
     input:
         expand(f"{SQUIDPY_DIR}/{{level}}/clustered.h5ad", level=LEVELS),
+        expand(f"{SQUIDPY_DIR}/{{level}}/clustered_{{batch_key}}.h5ad",
+               level=LEVELS, batch_key=ALT_BATCH_KEYS),
         expand(f"{SQUIDPY_RESULTS}/{{level}}/qc/qc_per_section.pdf", level=LEVELS),
         expand(f"{SQUIDPY_RESULTS}/{{level}}/qc/section_depth.pdf", level=LEVELS),
         expand(f"{SQUIDPY_RESULTS}/{{level}}/qc/section_qc.csv", level=LEVELS),
@@ -1178,12 +1355,17 @@ rule squidpy_all:
         expand(f"{SQUIDPY_RESULTS}/{{level}}/spatial/{{sample}}_panels.pdf",
                level=LEVELS, sample=sorted(VISIUMHD_SAMPLES)),
         expand(f"{SQUIDPY_DIR}/{{level}}/spatial_stats.h5ad", level=HEAVY_LEVELS),
+        expand(f"{SQUIDPY_DIR}/{{level}}/spatial_stats_{{batch_key}}.h5ad",
+               level=HEAVY_LEVELS, batch_key=ALT_BATCH_KEYS),
         expand(f"{SQUIDPY_RESULTS}/{{level}}/ccc/{{condition}}_liana_cellchat.csv",
                level=HEAVY_LEVELS, condition=CONDITIONS),
         expand(f"{SQUIDPY_DIR}/{{level}}/image_features/{{sample}}.csv",
                level=HEAVY_LEVELS, sample=sorted(VISIUMHD_SAMPLES)),
         expand(f"{SQUIDPY_RESULTS}/{{level}}/de/{{comparison}}/whole_core.csv",
-               level=DE_LEVELS, comparison=sorted(DE_COMPARISONS))
+               level=DE_LEVELS, comparison=sorted(DE_COMPARISONS)),
+        expand(f"{SQUIDPY_RESULTS}/{{level}}/de_{{batch_key}}/{{comparison}}/whole_core.csv",
+               level=DE_LEVELS, comparison=sorted(DE_COMPARISONS),
+               batch_key=ALT_BATCH_KEYS)
 
 
 # Rule: Generate multi-sample summary
