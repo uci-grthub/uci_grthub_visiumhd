@@ -1,0 +1,38 @@
+# Pixi environment for the downstream squidpy / LIANA+ rules.
+#
+# Every package comes from conda-forge or bioconda, so solving needs no conda-to-PyPI
+# mapping (the step that makes the workspace pixi.toml fail on this cluster).
+#
+# liana is held at 1.x: 2.0 needs scanpy >= 1.12 and anndata >= 0.13, and the
+# squidpy_ccc.py calls (li.mt.cellchat, li.mt.bivariate) are written against 1.x.
+# liana 1.10 pins numba < 0.61, which in turn caps numpy below 2.1.
+#
+# Usage (the rules also export PYTHONNOUSERSITE=1, because ~/.local site-packages
+# otherwise shadows the env's own packages):
+#   PYTHONNOUSERSITE=1 pixi run --manifest-path envs/squidpy/pixi.toml python src/...
+
+[workspace]
+name = "squidpy"
+channels = ["conda-forge", "bioconda"]
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[dependencies]
+python = "3.12.*"
+anndata = "0.12.*"
+scanpy = "1.11.*"
+squidpy = "1.8.*"
+liana = "1.10.*"
+omnipath = ">=1.0.6"
+harmonypy = "*"
+leidenalg = "*"
+python-igraph = "*"
+scikit-learn = "*"
+pyarrow = "*"
+shapely = "*"
+tifffile = "*"
+matplotlib = "*"
+pydeseq2 = "0.5.*"
+
+[activation.env]
+PYTHONNOUSERSITE = "1"

@@ -46,16 +46,20 @@ def read_polygons_with_names(
     pixel_size: float = 1.0,
     out_dir: Optional[str] = None,
     save_csvs: bool = True,
+    skiprows: int = 2,
 ) -> Dict[str, Any]:
     """
     Read a Xenium coordinates.csv and return a mapping from selection name to geometry.
 
     Inputs:
     - coordinates_csv: path to CSV file (file must contain columns 'Selection', 'X', 'Y').
-      The CSV is read with pd.read_csv(..., skiprows=2) to accommodate the Xenium header.
+      The CSV is read with pd.read_csv(..., skiprows=skiprows) to accommodate the Xenium
+      header.
     - pixel_size: divisor to convert pixel coordinates to physical units (default 1.0).
     - out_dir: optional directory where per-selection CSVs will be written; created if needed.
     - save_csvs: whether to save per-selection CSV files (default True).
+    - skiprows: number of preamble lines before the header row. Defaults to 2, the Xenium
+      layout; pass 0 for a plain CSV whose first line is already the header.
 
     Returns:
     - dict mapping selection name -> geometry. Geometry will be either:
@@ -69,7 +73,7 @@ def read_polygons_with_names(
     - If Shapely is not installed, the function will still work but will return
       plain Python lists/tuples of coordinates instead of Shapely geometry objects.
     """
-    df = pd.read_csv(coordinates_csv, skiprows=2)
+    df = pd.read_csv(coordinates_csv, skiprows=skiprows)
 
     # # Normalize the Selection column so names are cleaned and consistent
     # if "Selection" in df.columns:
@@ -149,10 +153,15 @@ if __name__ == "__main__":
     p.add_argument("--pixel-size", type=float, default=1.0, help="Pixel size to divide X/Y by")
     p.add_argument("--out-dir", default=None, help="Output directory to store per-selection CSVs")
     p.add_argument("--no-save", dest="save", action="store_false", help="Don't save per-selection CSVs")
+    p.add_argument("--skiprows", type=int, default=2, help="Preamble lines before the header row")
     args = p.parse_args()
 
     polygons = read_polygons_with_names(
-        args.coordinates_csv, pixel_size=args.pixel_size, out_dir=args.out_dir, save_csvs=args.save
+        args.coordinates_csv,
+        pixel_size=args.pixel_size,
+        out_dir=args.out_dir,
+        save_csvs=args.save,
+        skiprows=args.skiprows,
     )
 
     # Print a short summary

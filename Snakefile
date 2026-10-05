@@ -10,9 +10,11 @@ onerror:
    shell("mail -s 'ERROR' {EMAIL} < {log}")
 
 from collections import Counter
+import csv
 from datetime import datetime
 import fnmatch
 import glob
+import json
 import os
 import re
 
@@ -67,9 +69,57 @@ SAMPLES = auto_samples if auto_samples else (config.get("samples") or [])
 FASTQ_DIR = config.get("paths", {}).get("fastqs", "data/FASTQ")
 TRANSCRIPTOME = config["references"]["transcriptome"]
 OUTPUT_DIR = config["paths"]["output"]
+RESULTS_DIR = config["paths"].get("results", "results")
 
 # Visium HD / Space Ranger configuration
 SPACERANGER = config.get("spaceranger", {})
+
+# Downstream spatial analysis (squidpy / LIANA+) configuration
+SQUIDPY = config.get("squidpy", {})
+SQUIDPY_DIR = f"{OUTPUT_DIR}/squidpy"
+SQUIDPY_RESULTS = f"{RESULTS_DIR}/squidpy"
+# pixi env for every squidpy rule (envs/squidpy/pixi.toml, locked in pixi.lock)
+SQUIDPY_MANIFEST = SQUIDPY.get("pixi_manifest", "envs/squidpy/pixi.toml")
+# --frozen: use the installed env as locked, without re-checking or updating it, so
+# parallel jobs do not race on envs/squidpy/.pixi (install it first with
+# scripts/install_squidpy_pixi.sh).
+# -X faulthandler: a segfault in numba/igraph/BLAS still prints the Python stack to the log
+SQUIDPY_PYTHON = (f"pixi run --frozen --manifest-path {SQUIDPY_MANIFEST} "
+                  "python -X faulthandler")
+BIN_SIZES = [str(b) for b in SQUIDPY.get("bin_sizes", ["008", "016"])]
+HEAVY_BIN = str(SQUIDPY.get("heavy_bin_size", "016"))
+SQUIDPY_CELL = SQUIDPY.get("cell", {})
+USE_CELLS = bool(SQUIDPY_CELL.get("enabled", True))
+# analysis levels: a directory name per bin size, plus "cell" for the segmented outputs
+LEVELS = [f"square_{b}um" for b in BIN_SIZES] + (["cell"] if USE_CELLS else [])
+HEAVY_LEVELS = [f"square_{HEAVY_BIN}um"] + (["cell"] if USE_CELLS else [])
+# graphs, SVG and plots are drawn per capture area; kept apart from the Harmony batch key
+LIBRARY_KEY = SQUIDPY.get("library_key", "run_id")
+CONDITIONS = SQUIDPY.get("conditions", ["normal", "pigmented"])
+CORE_ANNOTATION_DIR = SQUIDPY.get("core_annotation_dir", "metadata/core_annotations")
+CORE_ANNOTATION_PATTERN = SQUIDPY.get("core_annotation_pattern", "{sample}_cores.csv")
+SAMPLE_METADATA = SQUIDPY.get("sample_metadata", "metadata/sample_metadata.csv")
+
+# {level} sits next to {sample} in the squidpy paths, so it has to be constrained or
+# Snakemake splits "square_016um/per_sample/A1_TMA4" in the wrong place
+wildcard_constraints:
+    level = r"square_\d{3}um|cell",
+    condition = r"[A-Za-z0-9_-]+",
+    comparison = r"[A-Za-z0-9_-]+"
+
+
+def squidpy_resource(rule_name, key, default):
+    """Look up one Slurm resource for a squidpy rule from config.yaml."""
+    resources = SQUIDPY.get("resources", {})
+    return resources.get(rule_name, {}).get(key, default)
+
+
+def squidpy_partition():
+    return SQUIDPY.get("resources", {}).get("partition", "standard")
+
+
+def squidpy_account():
+    return SQUIDPY.get("resources", {}).get("account", "sbsandme_lab")
 
 def read_cytassist_run_info(path):
     """Parse a CytAssist *-run-info.csv into a key -> value dict."""
@@ -217,6 +267,7 @@ def get_visiumhd_samples():
     name_counts = Counter(entry["name"] for entry in areas)
 
     samples = {}
+    missing_images = []
     for entry in areas:
         name, slide, area = entry["name"], entry["slide"], entry["area"]
 
@@ -245,10 +296,10 @@ def get_visiumhd_samples():
                   f"{slide}_{area}.fastq_prefix if the core named them differently")
             continue
 
+        # the H&E image is required: Space Ranger segments nuclei from it
         image = override.get("image") or find_microscope_image(name, slide, area)
         if not image:
-            print(f"Warning: no microscope image for '{sample_id}'; running with "
-                  f"the CytAssist image only")
+            missing_images.append(f"{sample_id} ({slide} {area})")
 
         samples[sample_id] = {
             # slide/area are read from the CytAssist image metadata; these are
@@ -264,6 +315,11 @@ def get_visiumhd_samples():
             "fastq_prefix": fastq_prefix,
             "fastq_dirs": fastq_dirs,
         }
+    if missing_images:
+        raise ValueError(
+            "No H&E microscope image for: " + ", ".join(missing_images) +
+            ". Cell segmentation needs one per capture area; check "
+            "spaceranger.microscope_image_* or set spaceranger.samples.<id>.image")
     return samples
 
 VISIUMHD_SAMPLES = get_visiumhd_samples()
@@ -281,6 +337,7 @@ rule all:
         # Visium HD outputs
         expand(f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/web_summary.html", sample=sorted(VISIUMHD_SAMPLES)),
         expand(f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/binned_outputs/square_008um/filtered_feature_bc_matrix", sample=sorted(VISIUMHD_SAMPLES)),
+        expand(f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/segmented_outputs/filtered_feature_cell_matrix.h5", sample=sorted(VISIUMHD_SAMPLES)),
         expand(f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/web_summary.html", sample=SAMPLES),
         expand(f"{OUTPUT_DIR}/cellranger/{{sample}}/outs/filtered_feature_bc_matrix", sample=SAMPLES),
         f"{OUTPUT_DIR}/multi_sample_summary.csv",
@@ -308,7 +365,9 @@ rule all:
 rule spaceranger_all:
     input:
         expand(f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/web_summary.html", sample=sorted(VISIUMHD_SAMPLES)),
-        expand(f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/binned_outputs/square_008um/filtered_feature_bc_matrix", sample=sorted(VISIUMHD_SAMPLES))
+        expand(f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/binned_outputs/square_008um/filtered_feature_bc_matrix", sample=sorted(VISIUMHD_SAMPLES)),
+        expand(f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/segmented_outputs/filtered_feature_cell_matrix.h5", sample=sorted(VISIUMHD_SAMPLES)),
+        f"{RESULTS_DIR}/spaceranger_metrics_summary.csv"
 
 
 # Helper function to get FASTQ files for a sample
@@ -423,8 +482,6 @@ def spaceranger_extra_args(wildcards, input):
     """Assemble the optional Space Ranger flags for a sample."""
     meta = VISIUMHD_SAMPLES[wildcards.sample]
     args = []
-    if input.image:
-        args.append(f'--image="{input.image}"')
     if input.loupe_alignment:
         args.append(f'--loupe-alignment="{input.loupe_alignment}"')
     if meta.get("slide") and meta.get("area"):
@@ -440,13 +497,15 @@ rule spaceranger_count:
         transcriptome = SPACERANGER.get("transcriptome", ""),
         probe_set = SPACERANGER.get("probe_set", ""),
         cytaimage = lambda wildcards: spaceranger_input(wildcards.sample, "cytaimage"),
-        image = lambda wildcards: spaceranger_input(wildcards.sample, "image"),
+        image = lambda wildcards: VISIUMHD_SAMPLES[wildcards.sample]["image"],
         loupe_alignment = lambda wildcards: spaceranger_input(wildcards.sample, "loupe_alignment")
     output:
         web_summary = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/web_summary.html",
         metrics_summary = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/metrics_summary.csv",
         filtered_matrix_h5 = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/binned_outputs/square_008um/filtered_feature_bc_matrix.h5",
-        filtered_matrix_dir = directory(f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/binned_outputs/square_008um/filtered_feature_bc_matrix")
+        filtered_matrix_dir = directory(f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/binned_outputs/square_008um/filtered_feature_bc_matrix"),
+        cell_matrix_h5 = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/segmented_outputs/filtered_feature_cell_matrix.h5",
+        cell_segmentations = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/segmented_outputs/cell_segmentations.geojson"
     params:
         manifest = SPACERANGER.get("pixi_manifest", "envs/spaceranger/pixi.toml"),
         outdir = f"{OUTPUT_DIR}/spaceranger/{{sample}}",
@@ -478,12 +537,652 @@ rule spaceranger_count:
             --fastqs={params.fastq_dirs} \
             --sample={params.fastq_prefix} \
             --cytaimage="{input.cytaimage}" \
+            --image="{input.image}" \
             --create-bam={params.create_bam} \
             --localcores={params.localcores} \
             --localmem={params.localmem} \
             --disable-ui \
             {params.extra} > {log} 2>&1
         """
+
+
+# Rule: combine the per-capture-area Space Ranger metrics into one table
+#
+# spaceranger aggr is not an option here: it rejects Visium HD runs
+# ("Visium HD runs ... are not currently supported by spaceranger aggr").
+rule combine_spaceranger_metrics:
+    input:
+        metrics = expand(f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/metrics_summary.csv", sample=sorted(VISIUMHD_SAMPLES))
+    output:
+        combined = f"{RESULTS_DIR}/spaceranger_metrics_summary.csv"
+    params:
+        script = "src/combine_spaceranger_metrics.py"
+    threads: 1
+    resources:
+        mem_mb = 4000,
+        cpus = 1,
+        runtime = 30,
+        partition = SPACERANGER.get("partition", "standard"),
+        account = SPACERANGER.get("account", "sbsandme_lab")
+    shell:
+        """
+        python {params.script} \
+            --metrics {input.metrics} \
+            --output {output.combined}
+        """
+
+
+# ---------------------------------------------------------------------------
+# Downstream spatial analysis: squidpy + LIANA+
+#
+# spaceranger aggr rejects Visium HD, so the capture areas are combined here from the
+# per-run binned matrices. Space Ranger also has no notion of which TMA core a bin came
+# from, and every contrast in this experiment (normal vs pigmented, W0 vs W16) lives
+# inside a capture area, so rule squidpy_make_adata depends on the manual Loupe core
+# annotations named by squidpy.core_annotation_dir/_pattern -- see docs/core_annotation.md.
+#
+# Every shell block exports PYTHONNOUSERSITE=1: ~/.local/lib/python3.12/site-packages
+# otherwise shadows numpy, scanpy, anndata, matplotlib and ~35 more packages of the
+# pixi env. The rules run through `pixi run --manifest-path envs/squidpy/pixi.toml`,
+# so snakemake needs no --use-conda for them.
+# ---------------------------------------------------------------------------
+
+def read_run_tma():
+    """run id -> TMA number, from the cytassist_sample and tma columns of sample_metadata."""
+    if not os.path.exists(SAMPLE_METADATA):
+        return {}
+    with open(SAMPLE_METADATA, newline="") as handle:
+        return {row["cytassist_sample"]: row["tma"] for row in csv.DictReader(handle)}
+
+RUN_TMA = read_run_tma()
+
+def core_annotation_path(wildcards):
+    """The Loupe core export for one capture area, per squidpy.core_annotation_pattern."""
+    try:
+        tma = RUN_TMA[wildcards.sample] if "{tma}" in CORE_ANNOTATION_PATTERN else None
+    except KeyError:
+        raise ValueError(f"{wildcards.sample} is not in the cytassist_sample column of "
+                         f"{SAMPLE_METADATA}, so its core annotation cannot be named")
+    name = CORE_ANNOTATION_PATTERN.format(sample=wildcards.sample, tma=tma)
+    return os.path.join(CORE_ANNOTATION_DIR, name)
+
+def spatial_param(key, default):
+    """A spatial-graph setting per level: squidpy.cell overrides squidpy.spatial for cells."""
+    def inner(wildcards):
+        if wildcards.level == "cell" and key in SQUIDPY_CELL:
+            return SQUIDPY_CELL[key]
+        return SQUIDPY.get("spatial", {}).get(key, default)
+    return inner
+
+
+# Rule: one AnnData per capture area per bin size, with TMA cores assigned to bins
+rule squidpy_make_adata:
+    wildcard_constraints:
+        level = r"square_\d{3}um"
+    input:
+        script = "src/squidpy_make_adata.py",
+        annotation_module = "src/squidpy_core_annotation.py",
+        matrix_h5 = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/binned_outputs/{{level}}/filtered_feature_bc_matrix.h5",
+        positions = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/binned_outputs/{{level}}/spatial/tissue_positions.parquet",
+        scalefactors = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/binned_outputs/{{level}}/spatial/scalefactors_json.json",
+        core_annotation = core_annotation_path,
+        sample_metadata = SAMPLE_METADATA
+    output:
+        adata = f"{SQUIDPY_DIR}/{{level}}/per_sample/{{sample}}.h5ad",
+        qc_figure = f"{SQUIDPY_RESULTS}/{{level}}/qc/{{sample}}_core_assignment.pdf"
+    threads: squidpy_resource("make_adata", "cpus", 2)
+    resources:
+        mem_mb = squidpy_resource("make_adata", "mem_mb", 32000),
+        cpus = squidpy_resource("make_adata", "cpus", 2),
+        runtime = squidpy_resource("make_adata", "runtime", 60),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_make_adata_{{sample}}_{{level}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        export PYTHONPATH=src:${{PYTHONPATH:-}}
+        {SQUIDPY_PYTHON} {input.script} \
+            --matrix-h5 {input.matrix_h5} \
+            --positions {input.positions} \
+            --scalefactors {input.scalefactors} \
+            --core-annotation {input.core_annotation} \
+            --sample-metadata {input.sample_metadata} \
+            --run-id {wildcards.sample} \
+            --output {output.adata} \
+            --qc-figure {output.qc_figure} > {log} 2>&1
+        """
+
+
+# Rule: one AnnData per capture area from the segmented cells (Space Ranger >= 4.0)
+#
+# Cores are drawn at 8 um, so the 8 um positions travel with the export; each cell takes
+# the core that holds most of its 2 um bins in barcode_mappings.parquet.
+rule squidpy_make_adata_cell:
+    input:
+        script = "src/squidpy_make_adata.py",
+        annotation_module = "src/squidpy_core_annotation.py",
+        matrix_h5 = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/segmented_outputs/filtered_feature_cell_matrix.h5",
+        segmentations = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/segmented_outputs/cell_segmentations.geojson",
+        scalefactors = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/segmented_outputs/spatial/scalefactors_json.json",
+        barcode_mappings = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/barcode_mappings.parquet",
+        positions = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/binned_outputs/square_008um/spatial/tissue_positions.parquet",
+        core_annotation = core_annotation_path,
+        sample_metadata = SAMPLE_METADATA
+    output:
+        adata = f"{SQUIDPY_DIR}/cell/per_sample/{{sample}}.h5ad",
+        qc_figure = f"{SQUIDPY_RESULTS}/cell/qc/{{sample}}_core_assignment.pdf"
+    params:
+        # optional: Space Ranger only writes it when the local Azimuth model ran
+        cell_types = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/segmented_outputs/cell_types/Azimuth/cell_types.csv"
+    threads: squidpy_resource("make_adata", "cpus", 2)
+    resources:
+        mem_mb = squidpy_resource("make_adata", "mem_mb", 32000),
+        cpus = squidpy_resource("make_adata", "cpus", 2),
+        runtime = squidpy_resource("make_adata", "runtime", 60),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_make_adata_{{sample}}_cell.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        export PYTHONPATH=src:${{PYTHONPATH:-}}
+        {SQUIDPY_PYTHON} {input.script} \
+            --level cell \
+            --matrix-h5 {input.matrix_h5} \
+            --positions {input.positions} \
+            --scalefactors {input.scalefactors} \
+            --segmentations {input.segmentations} \
+            --barcode-mappings {input.barcode_mappings} \
+            --cell-types {params.cell_types} \
+            --core-annotation {input.core_annotation} \
+            --sample-metadata {input.sample_metadata} \
+            --run-id {wildcards.sample} \
+            --output {output.adata} \
+            --qc-figure {output.qc_figure} > {log} 2>&1
+        """
+
+
+def squidpy_min_counts(wildcards):
+    """Absolute count floor for one level, from squidpy.qc.min_counts_per_level.
+
+    One number is not comparable across levels. An 8 um bin covers a quarter the area of
+    a 16 um bin, so the same floor is far stricter there: at min_counts 10, 16 um kept
+    127,421 of 185,921 bins (69%) against 350,892 of ~744,000 at 8 um (47%). Falls back
+    to squidpy.qc.min_counts when a level is not listed.
+    """
+    qc = SQUIDPY.get("qc", {})
+    return qc.get("min_counts_per_level", {}).get(
+        wildcards.level, qc.get("min_counts", 10))
+
+
+def squidpy_quantile_flags():
+    """Per-section quantile trim flags, or nothing when it is switched off.
+
+    Same shape as squidpy_subsample_flag: the script defaults to no trim, so the
+    config is the only place the filter is turned on.
+    """
+    trim = SQUIDPY.get("qc", {}).get("quantile_trim", {})
+    if not trim.get("enabled"):
+        return ""
+    return (f"--quantile-lower {trim.get('lower', 0.1)} "
+            f"--quantile-upper {trim.get('upper', 0.9)} "
+            f"--quantile-metric {trim.get('metric', 'total_counts')}")
+
+
+# Rule: concatenate the capture areas for one bin size and apply QC filters
+rule squidpy_combine:
+    input:
+        script = "src/squidpy_combine.py",
+        annotation_module = "src/squidpy_core_annotation.py",
+        adatas = expand(f"{SQUIDPY_DIR}/{{{{level}}}}/per_sample/{{sample}}.h5ad",
+                        sample=sorted(VISIUMHD_SAMPLES))
+    output:
+        combined = f"{SQUIDPY_DIR}/{{level}}/combined.h5ad",
+        qc_table = f"{SQUIDPY_RESULTS}/{{level}}/qc/bins_per_core.csv",
+        qc_figure = f"{SQUIDPY_RESULTS}/{{level}}/qc/qc_violin.pdf",
+        qc_sections = f"{SQUIDPY_RESULTS}/{{level}}/qc/qc_per_section.pdf",
+        qc_quantiles = f"{SQUIDPY_RESULTS}/{{level}}/qc/quantile_bounds.csv",
+        qc_section_table = f"{SQUIDPY_RESULTS}/{{level}}/qc/section_qc.csv",
+        qc_section_depth = f"{SQUIDPY_RESULTS}/{{level}}/qc/section_depth.pdf"
+    params:
+        qc_group_key = SQUIDPY.get("qc", {}).get("group_key", "core_id"),
+        quantile = squidpy_quantile_flags(),
+        section_gate = SQUIDPY.get("qc", {}).get("section_gate", {}).get(
+            "interior_median_counts", 50),
+        min_counts = squidpy_min_counts,
+        min_genes = SQUIDPY.get("qc", {}).get("min_genes", 0),
+        min_cells = SQUIDPY.get("qc", {}).get("min_cells", 10),
+        max_pct_mt = SQUIDPY.get("qc", {}).get("max_pct_mt", 25)
+    threads: squidpy_resource("combine", "cpus", 4)
+    resources:
+        mem_mb = squidpy_resource("combine", "mem_mb", 128000),
+        cpus = squidpy_resource("combine", "cpus", 4),
+        runtime = squidpy_resource("combine", "runtime", 180),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_combine_{{level}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        {SQUIDPY_PYTHON} {input.script} \
+            --adatas {input.adatas} \
+            --output {output.combined} \
+            --qc-table {output.qc_table} \
+            --qc-figure {output.qc_figure} \
+            --qc-section-figure {output.qc_sections} \
+            --qc-group-key {params.qc_group_key} \
+            --quantile-report {output.qc_quantiles} \
+            --section-qc-table {output.qc_section_table} \
+            --section-depth-figure {output.qc_section_depth} \
+            --section-gate-counts {params.section_gate} \
+            {params.quantile} \
+            --min-counts {params.min_counts} \
+            --min-genes {params.min_genes} \
+            --min-cells {params.min_cells} \
+            --max-pct-mt {params.max_pct_mt} > {log} 2>&1
+        """
+
+
+def squidpy_cluster_setting(key, default):
+    """One squidpy.cluster setting, overridable per level.
+
+    Bin size changes what these settings mean. An 8 um bin covers a quarter the area of a
+    16 um bin and runs at a third the depth, so the neighbour count that leaves the 16 um
+    graph in a single connected component leaves the 8 um graph in 61, which forces 160
+    clusters holding under 100 bins each. cluster.<key>_per_level wins over cluster.<key>.
+    """
+    def inner(wildcards):
+        cluster = SQUIDPY.get("cluster", {})
+        return cluster.get(f"{key}_per_level", {}).get(
+            wildcards.level, cluster.get(key, default))
+    return inner
+
+
+def squidpy_cluster_resource(key, default):
+    """8 um carries 2.5M bins against 650k at 16 um, so it gets its own allocation."""
+    def inner(wildcards):
+        name = {"square_008um": "cluster_008", "cell": "cluster_cell"}.get(
+            wildcards.level, "cluster_016")
+        return squidpy_resource(name, key, default)
+    return inner
+
+
+def squidpy_subsample_flag(wildcards):
+    """Cap the 8 um object, which otherwise densifies to ~20 GB for the PCA."""
+    cap = SQUIDPY.get("cluster", {}).get("subsample_008")
+    if wildcards.level == "square_008um" and cap:
+        return f"--subsample {int(cap)}"
+    return ""
+
+
+# Rule: normalise, Harmony-integrate on squidpy.cluster.batch_key, and cluster
+rule squidpy_cluster:
+    input:
+        script = "src/squidpy_cluster.py",
+        combined = f"{SQUIDPY_DIR}/{{level}}/combined.h5ad"
+    output:
+        clustered = f"{SQUIDPY_DIR}/{{level}}/clustered.h5ad",
+        markers = f"{SQUIDPY_RESULTS}/{{level}}/markers.csv"
+    params:
+        figure_dir = f"{SQUIDPY_RESULTS}/{{level}}/figures",
+        n_top_genes = SQUIDPY.get("cluster", {}).get("n_top_genes", 2000),
+        n_pcs = SQUIDPY.get("cluster", {}).get("n_pcs", 30),
+        n_neighbors = squidpy_cluster_setting("n_neighbors", 15),
+        resolution = squidpy_cluster_setting("resolution", 1.0),
+        batch_key = SQUIDPY.get("cluster", {}).get("batch_key", "sample_id"),
+        hvg_batch = (lambda k: f"--hvg-batch-key {k}" if k else "")(
+            SQUIDPY.get("cluster", {}).get("hvg_batch_key")),
+        theta = SQUIDPY.get("cluster", {}).get("harmony_theta", 2.0),
+        crosstab_dir = f"{SQUIDPY_RESULTS}/{{level}}/qc",
+        cluster_key = SQUIDPY.get("cluster", {}).get("cluster_key", "leiden"),
+        harmony = "" if SQUIDPY.get("cluster", {}).get("use_harmony", True) else "--no-harmony",
+        subsample = squidpy_subsample_flag
+    threads: squidpy_cluster_resource("cpus", 8)
+    resources:
+        mem_mb = squidpy_cluster_resource("mem_mb", 128000),
+        cpus = squidpy_cluster_resource("cpus", 8),
+        runtime = squidpy_cluster_resource("runtime", 480),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_cluster_{{level}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        {SQUIDPY_PYTHON} {input.script} \
+            --input {input.combined} \
+            --output {output.clustered} \
+            --figure-dir {params.figure_dir} \
+            --markers-csv {output.markers} \
+            --n-top-genes {params.n_top_genes} \
+            --n-pcs {params.n_pcs} \
+            --n-neighbors {params.n_neighbors} \
+            --resolution {params.resolution} \
+            --batch-key {params.batch_key} \
+            {params.hvg_batch} \
+            --theta {params.theta} \
+            --crosstab-dir {params.crosstab_dir} \
+            --cluster-key {params.cluster_key} \
+            {params.harmony} {params.subsample} > {log} 2>&1
+        """
+
+
+# Rule: neighbourhood enrichment, interaction matrix, centrality and co-occurrence
+rule squidpy_spatial_stats:
+    input:
+        script = "src/squidpy_spatial_stats.py",
+        clustered = f"{SQUIDPY_DIR}/{{level}}/clustered.h5ad"
+    output:
+        stats = f"{SQUIDPY_DIR}/{{level}}/spatial_stats.h5ad",
+        nhood = f"{SQUIDPY_RESULTS}/{{level}}/nhood_enrichment_zscore.csv",
+        interactions = f"{SQUIDPY_RESULTS}/{{level}}/interaction_matrix.csv",
+        centrality = f"{SQUIDPY_RESULTS}/{{level}}/centrality_scores.csv"
+    params:
+        results_dir = f"{SQUIDPY_RESULTS}/{{level}}",
+        figure_dir = f"{SQUIDPY_RESULTS}/{{level}}/figures",
+        cluster_key = SQUIDPY.get("cluster", {}).get("cluster_key", "leiden"),
+        library_key = LIBRARY_KEY,
+        coord_type = spatial_param("coord_type", "grid"),
+        n_neighs = spatial_param("n_neighs", 8),
+        n_rings = spatial_param("n_rings", 1),
+        n_perms = SQUIDPY.get("spatial", {}).get("n_perms", 1000),
+        group_keys = " ".join(SQUIDPY.get("spatial", {}).get("group_keys", ["condition"])),
+        interval = SQUIDPY.get("cooccurrence", {}).get("interval", 50),
+        max_radius_um = SQUIDPY.get("cooccurrence", {}).get("max_radius_um", 500),
+        n_splits = SQUIDPY.get("cooccurrence", {}).get("n_splits", 20),
+        max_bins = SQUIDPY.get("cooccurrence", {}).get("max_bins_per_group", 50000)
+    threads: squidpy_resource("spatial_stats", "cpus", 16)
+    resources:
+        mem_mb = squidpy_resource("spatial_stats", "mem_mb", 192000),
+        cpus = squidpy_resource("spatial_stats", "cpus", 16),
+        runtime = squidpy_resource("spatial_stats", "runtime", 720),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_spatial_stats_{{level}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        {SQUIDPY_PYTHON} {input.script} \
+            --input {input.clustered} \
+            --output {output.stats} \
+            --results-dir {params.results_dir} \
+            --figure-dir {params.figure_dir} \
+            --cluster-key {params.cluster_key} \
+            --library-key {params.library_key} \
+            --coord-type {params.coord_type} \
+            --n-neighs {params.n_neighs} \
+            --n-rings {params.n_rings} \
+            --n-perms {params.n_perms} \
+            --cooccurrence-interval {params.interval} \
+            --cooccurrence-max-radius-um {params.max_radius_um} \
+            --cooccurrence-splits {params.n_splits} \
+            --max-bins-per-group {params.max_bins} \
+            --group-keys {params.group_keys} \
+            --n-jobs {threads} > {log} 2>&1
+        """
+
+
+# Rule: spatially variable genes, scored within each capture area
+rule squidpy_svg:
+    input:
+        script = "src/squidpy_svg.py",
+        clustered = f"{SQUIDPY_DIR}/{{level}}/clustered.h5ad"
+    output:
+        table = f"{SQUIDPY_RESULTS}/{{level}}/svg/{{sample}}_spatial_autocorr.csv"
+    params:
+        figure_dir = f"{SQUIDPY_RESULTS}/{{level}}/svg",
+        library_key = LIBRARY_KEY,
+        mode = SQUIDPY.get("svg", {}).get("mode", "moran"),
+        n_perms = SQUIDPY.get("svg", {}).get("n_perms", 100),
+        n_top_genes = SQUIDPY.get("svg", {}).get("n_top_genes", 20),
+        n_neighs = spatial_param("n_neighs", 8),
+        coord_type = spatial_param("coord_type", "grid")
+    threads: squidpy_resource("svg", "cpus", 8)
+    resources:
+        mem_mb = squidpy_resource("svg", "mem_mb", 64000),
+        cpus = squidpy_resource("svg", "cpus", 8),
+        runtime = squidpy_resource("svg", "runtime", 240),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_svg_{{sample}}_{{level}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        {SQUIDPY_PYTHON} {input.script} \
+            --input {input.clustered} \
+            --run-id {wildcards.sample} \
+            --output-csv {output.table} \
+            --figure-dir {params.figure_dir} \
+            --library-key {params.library_key} \
+            --mode {params.mode} \
+            --n-perms {params.n_perms} \
+            --n-top-genes {params.n_top_genes} \
+            --n-neighs {params.n_neighs} \
+            --coord-type {params.coord_type} \
+            --n-jobs {threads} > {log} 2>&1
+        """
+
+
+# Rule: cell-cell communication, LIANA+ with CellChat scoring against CellChatDB
+#
+# sq.gr.ligrec is not used: it needs omnipath, which is broken against NumPy 2 here, and
+# it offers only a CellPhoneDB-style cluster permutation test.
+rule squidpy_ccc:
+    input:
+        script = "src/squidpy_ccc.py",
+        clustered = f"{SQUIDPY_DIR}/{{level}}/clustered.h5ad"
+    output:
+        table = f"{SQUIDPY_RESULTS}/{{level}}/ccc/{{condition}}_liana_cellchat.csv",
+        figure = f"{SQUIDPY_RESULTS}/{{level}}/ccc/{{condition}}_dotplot.pdf"
+    params:
+        groupby = SQUIDPY.get("ccc", {}).get("groupby", "leiden"),
+        group_key = SQUIDPY.get("ccc", {}).get("group_key", "condition"),
+        resource = SQUIDPY.get("ccc", {}).get("resource", "cellchatdb"),
+        n_perms = SQUIDPY.get("ccc", {}).get("n_perms", 1000),
+        expr_prop = SQUIDPY.get("ccc", {}).get("expr_prop", 0.1),
+        top_n = SQUIDPY.get("ccc", {}).get("top_n", 25),
+        local_name = SQUIDPY.get("ccc", {}).get("local_name", "cosine"),
+        local_n_perms = SQUIDPY.get("ccc", {}).get("local_n_perms", 100),
+        library_key = LIBRARY_KEY,
+        coord_type = spatial_param("coord_type", "grid"),
+        n_neighs = spatial_param("n_neighs", 8),
+        spatial_flag = (
+            f"--spatial-output {SQUIDPY_DIR}/{{level}}/ccc/{{condition}}_local.h5ad"
+            if SQUIDPY.get("ccc", {}).get("spatial_local", True) else ""
+        )
+    threads: squidpy_resource("ccc", "cpus", 16)
+    resources:
+        mem_mb = squidpy_resource("ccc", "mem_mb", 128000),
+        cpus = squidpy_resource("ccc", "cpus", 16),
+        runtime = squidpy_resource("ccc", "runtime", 480),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_ccc_{{condition}}_{{level}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        {SQUIDPY_PYTHON} {input.script} \
+            --input {input.clustered} \
+            --output-csv {output.table} \
+            --figure {output.figure} \
+            --group-key {params.group_key} \
+            --condition {wildcards.condition} \
+            --groupby {params.groupby} \
+            --resource {params.resource} \
+            --n-perms {params.n_perms} \
+            --expr-prop {params.expr_prop} \
+            --top-n {params.top_n} \
+            --local-name {params.local_name} \
+            --local-n-perms {params.local_n_perms} \
+            --library-key {params.library_key} \
+            --coord-type {params.coord_type} \
+            --n-neighs {params.n_neighs} \
+            --n-jobs {threads} {params.spatial_flag} > {log} 2>&1
+        """
+
+
+# Rule: H&E texture and summary features per bin, from the microscope TIFF
+rule squidpy_image_features:
+    input:
+        script = "src/squidpy_image_features.py",
+        clustered = f"{SQUIDPY_DIR}/{{level}}/clustered.h5ad"
+    output:
+        features = f"{SQUIDPY_DIR}/{{level}}/image_features/{{sample}}.csv"
+    params:
+        image_dir = SPACERANGER.get("microscope_image_dir", ""),
+        # lambda, or Snakemake reads the literal {token} in the pattern as a wildcard
+        image_pattern = lambda wildcards: SPACERANGER.get(
+            "microscope_image_pattern", "TMA {token}.tif"),
+        image_regex = SPACERANGER.get("microscope_image_regex", r"TMA\s*(\d+)$"),
+        library_key = LIBRARY_KEY,
+        features = " ".join(SQUIDPY.get("image_features", {}).get("features", ["summary", "texture"])),
+        scale = SQUIDPY.get("image_features", {}).get("scale", 0.5),
+        spot_scale = SQUIDPY.get("image_features", {}).get("spot_scale", 2.0)
+    threads: squidpy_resource("image_features", "cpus", 8)
+    resources:
+        mem_mb = squidpy_resource("image_features", "mem_mb", 96000),
+        cpus = squidpy_resource("image_features", "cpus", 8),
+        runtime = squidpy_resource("image_features", "runtime", 240),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_image_features_{{sample}}_{{level}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        {SQUIDPY_PYTHON} {input.script} \
+            --input {input.clustered} \
+            --run-id {wildcards.sample} \
+            --output-csv {output.features} \
+            --image-dir "{params.image_dir}" \
+            --image-pattern "{params.image_pattern}" \
+            --image-regex "{params.image_regex}" \
+            --library-key {params.library_key} \
+            --features {params.features} \
+            --scale {params.scale} \
+            --spot-scale {params.spot_scale} \
+            --n-jobs {threads} > {log} 2>&1
+        """
+
+
+# Rule: spatial scatter panels per capture area
+rule squidpy_spatial_plots:
+    input:
+        script = "src/squidpy_spatial_plots.py",
+        clustered = f"{SQUIDPY_DIR}/{{level}}/clustered.h5ad"
+    output:
+        figure = f"{SQUIDPY_RESULTS}/{{level}}/spatial/{{sample}}_panels.pdf"
+    params:
+        library_key = LIBRARY_KEY
+    threads: squidpy_resource("spatial_plots", "cpus", 2)
+    resources:
+        mem_mb = squidpy_resource("spatial_plots", "mem_mb", 32000),
+        cpus = squidpy_resource("spatial_plots", "cpus", 2),
+        runtime = squidpy_resource("spatial_plots", "runtime", 60),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_spatial_plots_{{sample}}_{{level}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        {SQUIDPY_PYTHON} {input.script} \
+            --input {input.clustered} \
+            --run-id {wildcards.sample} \
+            --output {output.figure} \
+            --library-key {params.library_key} > {log} 2>&1
+        """
+
+
+# Pseudobulk differential expression: one comparison from squidpy.de.comparisons, whole
+# core and per cluster, with pyDESeq2 across cores (see src/squidpy_de.py). Counts come
+# from combined.h5ad because clustered.h5ad keeps only the highly variable genes.
+SQUIDPY_DE = SQUIDPY.get("de", {})
+DE_COMPARISONS = SQUIDPY_DE.get("comparisons", {})
+DE_LEVELS = SQUIDPY_DE.get("levels", HEAVY_LEVELS)
+
+rule squidpy_de:
+    input:
+        script = "src/squidpy_de.py",
+        combined = f"{SQUIDPY_DIR}/{{level}}/combined.h5ad",
+        clustered = f"{SQUIDPY_DIR}/{{level}}/clustered.h5ad",
+        sample_metadata = SAMPLE_METADATA
+    output:
+        whole_core = f"{SQUIDPY_RESULTS}/{{level}}/de/{{comparison}}/whole_core.csv",
+        per_cluster = f"{SQUIDPY_RESULTS}/{{level}}/de/{{comparison}}/per_cluster.csv",
+        samples = f"{SQUIDPY_RESULTS}/{{level}}/de/{{comparison}}/samples.csv",
+        volcano = f"{SQUIDPY_RESULTS}/{{level}}/de/{{comparison}}/volcano.pdf"
+    params:
+        outdir = f"{SQUIDPY_RESULTS}/{{level}}/de/{{comparison}}",
+        comparison = lambda wildcards: json.dumps(DE_COMPARISONS[wildcards.comparison]),
+        sample_key = SQUIDPY_DE.get("sample_key", "core_index"),
+        cluster_key = SQUIDPY_DE.get("cluster_key", "leiden"),
+        min_obs = SQUIDPY_DE.get("min_obs_per_pseudobulk", 50),
+        min_samples = SQUIDPY_DE.get("min_samples_per_group", 2),
+        min_gene_counts = SQUIDPY_DE.get("min_gene_counts", 10),
+        alpha = SQUIDPY_DE.get("alpha", 0.05)
+    threads: squidpy_resource("de", "cpus", 4)
+    resources:
+        mem_mb = squidpy_resource("de", "mem_mb", 32000),
+        cpus = squidpy_resource("de", "cpus", 4),
+        runtime = squidpy_resource("de", "runtime", 120),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_de_{{comparison}}_{{level}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        {SQUIDPY_PYTHON} {input.script} \
+            --counts {input.combined} \
+            --clustered {input.clustered} \
+            --sample-metadata {input.sample_metadata} \
+            --name {wildcards.comparison} \
+            --comparison '{params.comparison}' \
+            --outdir {params.outdir} \
+            --sample-key {params.sample_key} \
+            --cluster-key {params.cluster_key} \
+            --min-obs-per-pseudobulk {params.min_obs} \
+            --min-samples-per-group {params.min_samples} \
+            --min-gene-counts {params.min_gene_counts} \
+            --alpha {params.alpha} \
+            --n-jobs {threads} > {log} 2>&1
+        """
+
+
+# Target rule: every DE comparison at every DE level
+rule squidpy_de_all:
+    input:
+        expand(f"{SQUIDPY_RESULTS}/{{level}}/de/{{comparison}}/whole_core.csv",
+               level=DE_LEVELS, comparison=sorted(DE_COMPARISONS))
+
+
+# Target rule: the whole downstream spatial analysis
+rule squidpy_all:
+    input:
+        expand(f"{SQUIDPY_DIR}/{{level}}/clustered.h5ad", level=LEVELS),
+        expand(f"{SQUIDPY_RESULTS}/{{level}}/qc/qc_per_section.pdf", level=LEVELS),
+        expand(f"{SQUIDPY_RESULTS}/{{level}}/qc/section_depth.pdf", level=LEVELS),
+        expand(f"{SQUIDPY_RESULTS}/{{level}}/qc/section_qc.csv", level=LEVELS),
+        expand(f"{SQUIDPY_RESULTS}/{{level}}/qc/quantile_bounds.csv", level=LEVELS),
+        expand(f"{SQUIDPY_RESULTS}/{{level}}/svg/{{sample}}_spatial_autocorr.csv",
+               level=LEVELS, sample=sorted(VISIUMHD_SAMPLES)),
+        expand(f"{SQUIDPY_RESULTS}/{{level}}/spatial/{{sample}}_panels.pdf",
+               level=LEVELS, sample=sorted(VISIUMHD_SAMPLES)),
+        expand(f"{SQUIDPY_DIR}/{{level}}/spatial_stats.h5ad", level=HEAVY_LEVELS),
+        expand(f"{SQUIDPY_RESULTS}/{{level}}/ccc/{{condition}}_liana_cellchat.csv",
+               level=HEAVY_LEVELS, condition=CONDITIONS),
+        expand(f"{SQUIDPY_DIR}/{{level}}/image_features/{{sample}}.csv",
+               level=HEAVY_LEVELS, sample=sorted(VISIUMHD_SAMPLES)),
+        expand(f"{SQUIDPY_RESULTS}/{{level}}/de/{{comparison}}/whole_core.csv",
+               level=DE_LEVELS, comparison=sorted(DE_COMPARISONS))
 
 
 # Rule: Generate multi-sample summary

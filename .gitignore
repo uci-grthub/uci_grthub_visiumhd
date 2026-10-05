@@ -25,3 +25,5 @@ weblinks.txt
 geo_staging/
 scripts/rsync_visiumhd_fastqs.sh
 .pixi/
+docs/core_annotation.md
+docs/differential_expression.md

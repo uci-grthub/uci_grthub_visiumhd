@@ -14,6 +14,7 @@ metadata: "data/metadata.csv"
 paths: 
   fastqs: "data/FASTQ"
   output: "output"
+  results: "results"
 
 
 # Reference genome/transcriptome
@@ -32,7 +33,7 @@ params:
 
 # Space Ranger (Visium HD) parameters
 spaceranger:
-  # pixi manifest that puts the cluster-wide Space Ranger install on PATH
+  # pixi manifest that puts Space Ranger 4.1.0 (in $TOOLS) on PATH
   pixi_manifest: "envs/spaceranger/pixi.toml"
   transcriptome: "/dfs8/commondata/spaceranger/ref/refdata-gex-GRCh38-2020-A"
   probe_set: "/dfs8/commondata/spaceranger/probe/Human_V2/Visium_Human_Transcriptome_Probe_Set_v2.0_GRCh38-2020-A.csv"
@@ -62,6 +63,219 @@ spaceranger:
   # Recognised: fastq_prefix, image, cytaimage, loupe_alignment, and slide+area
   # (which add --override-id, for when the CytAssist metadata is known wrong).
   samples: {}
+
+# Downstream spatial analysis (squidpy / LIANA+)
+#
+# The heavy permutation steps run at 16 um only: 8 um is 2.5M bins across the six
+# capture areas, against 650k at 16 um.
+squidpy:
+  # pixi env the squidpy rules run in (install: sbatch scripts/install_squidpy_pixi.sh);
+  # every rule also exports PYTHONNOUSERSITE=1, because
+  # ~/.local/lib/python3.12/site-packages otherwise shadows ~40 of its packages
+  pixi_manifest: "envs/squidpy/pixi.toml"
+  bin_sizes: ["008", "016"]
+  heavy_bin_size: "016"   # nhood, co-occurrence, cell-cell communication, image features
+  # spatial graphs, SVG, image features and plots are per capture area
+  library_key: "run_id"
+  # segmented cells (segmented_outputs/, Space Ranger >= 4.0 with an H&E image) run as a
+  # third level, "cell", through every step including the heavy ones. Cells are not a
+  # lattice, so the graph is k nearest neighbours rather than the square grid.
+  cell:
+    enabled: true
+    coord_type: "generic"
+    n_neighs: 6
+  core_annotation_dir: "metadata/regions"
+  # one Loupe core export per capture area inside core_annotation_dir; {sample} is
+  # the run id and {tma} its TMA number from the tma column of sample_metadata
+  core_annotation_pattern: "regions_tma{tma}.csv"
+  sample_metadata: "metadata/sample_metadata.csv"
+  conditions: ["normal", "pigmented"]
+  qc:
+    # A low absolute floor, then a relative per-section trim below. The floor exists to
+    # remove bins that are uninformative in ANY section, which a purely relative filter
+    # structurally cannot do: at min_counts 0 the object kept 32k bins under 10 counts,
+    # and those formed 110 isolated components in the kNN graph, forcing 273 Leiden
+    # clusters of which 213 held under 100 bins each.
+    #
+    # 10 is cheap because shallow bins hold almost no data: the floor removes 24% of
+    # bins for 0.5% of the sequencing, and leaves no bin under 10 counts. It is not the
+    # old min_counts of 50, which removed 87% of TMA2_top-right against 17% of
+    # TMA4_top-left -- a 6.3x spread in retention over a 75x spread in raw depth
+    # (4 to 300 counts), with condition nested inside section. At 10 the spread is 2.8x
+    # and reflects genuinely uneven tissue quality rather than hiding it.
+    min_counts: 10        # fallback for a level not listed below
+    # One floor is not comparable across levels. An 8 um bin covers a quarter the area of
+    # a 16 um bin, so 10 counts is ~4x stricter there: it keeps 69% of 16 um bins but
+    # only 53% of 8 um bins, and costs 0.5% of the sequencing at 16 um against 1.9% at
+    # 8 um. These values equalise that cost at ~0.5%, which is also what scaling by area
+    # gives (10 / 4 = 2.5). Cells are segmented objects with a median of 530 counts, so
+    # the floor barely binds there at all.
+    min_counts_per_level:
+      square_016um: 10    # 99.51% of counts kept
+      # 3 matches the 0.5%-of-counts criterion and area scaling, but is NOT in use: at
+      # floor 10 the 8 um graph already breaks into 61 components with n_neighbors 30,
+      # so a lower floor would fragment it further. The floor's job here is connectivity,
+      # not cost. Held at 10 pending the n_neighbors sweep for this level.
+      square_008um: 10    # 98.15% of counts
+      cell: 10            # 99.08%
+    min_genes: 0          # one depth axis is enough; counts and genes are collinear
+    min_cells: 10         # gene-level, applied once over the whole object after the trim
+    max_pct_mt: 25        # different axis from depth; removes 0.55% of bins overall
+    # QC figures, the quantile trim and the section report are all per section -- one TMA
+    # core. Grouping by run_id instead averages each bad section away against the three
+    # other cores of its capture area.
+    group_key: "core_id"
+    quantile_trim:
+      enabled: true
+      metric: "total_counts"
+      lower: 0.1          # applied to what survives min_counts, per section
+      # No upper trim. These are bins, not cells, so there is no doublet at the top: a
+      # high-count 16 um bin is dense tissue (epidermis, a dermal cell cluster). The top
+      # decile holds 63.7% of all UMIs in the experiment at a median of 1485 genes per
+      # bin, against 0.6% of UMIs for the bottom 30%. Cutting it discarded most of the
+      # signal.
+      upper: 1.0
+    section_gate:
+      # Report only. A section whose core interior is below this is named in the log and
+      # in qc/section_qc.csv; nothing is ever excluded automatically, because dropping
+      # TMA2's two pigmented cores would remove patient M007 from the paired
+      # normal-vs-pigmented comparison entirely.
+      #
+      # Interior median depth is a continuum across the 24 sections -- 8.5, 13, 29, 37,
+      # 39, 49, 50, 76 ... 481 -- so this number is a reporting convenience, not a
+      # boundary found in the data. 20 names the two sections that are separated on the
+      # column that does break cleanly, interior_frac_low: 0.53 and 0.43 of their core
+      # interior under 10 counts, against 0.26 for the next section down.
+      interior_median_counts: 20
+  cluster:
+    n_top_genes: 2000
+    n_pcs: 30
+    # 30 rather than scanpy's default 15: at 15 the kNN graph broke into 13 connected
+    # components, and Leiden returns at least one cluster per component, so ~40 clusters
+    # holding under 100 bins each were forced by topology and survived every resolution
+    # down to 0.25. At 30 the graph is a single component (50 is no better).
+    n_neighbors: 30
+    # Measured on that graph: 0.25 gives 33 clusters but collapses 38% of bins into one,
+    # 1.0 gives 60, and 0.5 gives 45 (31 of them substantial, largest 19% of bins) with
+    # the fewest bins -- 679, 0.5% -- left in clusters under 500 bins.
+    resolution: 0.5
+    # Per-level overrides for the two settings whose meaning changes with bin size.
+    # Both fall back to the values above for a level not listed. 8 um is pending the
+    # n_neighbors sweep: at 30 its graph has 61 components against 1 at 16 um.
+    # 8 um needs a much larger neighbourhood: measured on its Harmony embedding, the
+    # graph has 61 components at 30, 33 at 50, 11 at 75 and 1 at 100. Unlike 16 um,
+    # connecting it does not clear the small-cluster tail -- 78 clusters under 100 bins
+    # survive at every setting -- so those are genuinely sparse regions, not topology.
+    # At 100 the level gives 33 substantial clusters against 30 at 16 um.
+    n_neighbors_per_level:
+      square_008um: 100
+    resolution_per_level: {}
+    # one batch per biological sample, <patient_id>_<condition>_W<timepoint>: 22 levels
+    # against 24 cores, because the two A1_TMA6 cores of each condition are technical
+    # replicates of one sample and share a batch. Every batch is a single condition x
+    # timepoint, so Harmony also pulls the conditions together -- read
+    # qc/cluster_by_condition.csv, and compare against use_harmony: false, before
+    # trusting condition-specific clusters. Expression-level DE is unaffected: Harmony
+    # only rewrites the embedding.
+    batch_key: "sample_id"
+    harmony_theta: 2.0    # lower corrects more gently
+    # Select HVGs over the whole object rather than per batch: with near-empty sections
+    # in the mix, per-batch selection lets them contribute noise genes to the 2000.
+    hvg_batch_key: null
+    cluster_key: "leiden"
+    use_harmony: true
+    subsample_008: 800000  # cap for the 8 um object; null to cluster every bin
+  spatial:
+    coord_type: "grid"
+    n_neighs: 8           # Moore neighbourhood on the HD square lattice, not hex 6
+    n_rings: 1
+    n_perms: 1000
+    group_keys: ["condition", "timepoint_weeks"]
+  cooccurrence:
+    interval: 50          # number of radius steps
+    max_radius_um: 500    # 0 = squidpy's data-range default, which never samples
+                          # below a few hundred microns on a 6.5 mm capture area
+    n_splits: 20
+    max_bins_per_group: 50000
+  svg:
+    mode: "moran"
+    n_perms: 100
+    n_top_genes: 20
+  ccc:                    # LIANA+ with CellChat scoring against CellChatDB
+    resource: "cellchatdb"
+    groupby: "leiden"
+    group_key: "condition"
+    n_perms: 1000
+    expr_prop: 0.1
+    top_n: 25
+    spatial_local: true   # per-bin local LR scores via li.mt.bivariate
+    local_name: "cosine"
+    local_n_perms: 100
+  image_features:
+    features: ["summary", "texture"]
+    scale: 0.5
+    spot_scale: 2.0
+  # Pseudobulk differential expression (pyDESeq2), one job per level x comparison.
+  # Raw counts are summed per core (the TMA6 technical replicates share a core_index and
+  # are summed together), over the whole core and per cluster. Comparisons follow
+  # "metadata/9-30-26 Meta data for 10X visium seq data analysis.xlsx" (numbered below);
+  # log2FC is test / reference. subset filters on sample_metadata columns first, then
+  # only cores at test or reference of factor enter. paired: ~ patient_id + factor.
+  de:
+    levels: ["square_016um", "cell"]   # the 8 um clustered.h5ad is subsampled, so most bins lack a cluster
+    sample_key: "core_index"
+    cluster_key: "leiden"
+    min_obs_per_pseudobulk: 50         # drop sparse core x cluster pseudobulks
+    min_samples_per_group: 2
+    min_gene_counts: 10
+    alpha: 0.05
+    comparisons:
+      # 1: normal vs melasma, baseline
+      melasma_vs_normal_W0:
+        {factor: sample_type, test: melasma, reference: normal, paired: true,
+         subset: {diagnosis: melasma, timepoint_weeks: 0}}
+      # 2: normal vs melasma, 16 weeks
+      melasma_vs_normal_W16:
+        {factor: sample_type, test: melasma, reference: normal, paired: true,
+         subset: {diagnosis: melasma, timepoint_weeks: 16}}
+      # 3: melasma, baseline vs 16 weeks
+      melasma_W16_vs_W0:
+        {factor: timepoint_weeks, test: 16, reference: 0, paired: true,
+         subset: {sample_type: melasma}}
+      # 4: normal vs PIH, baseline
+      PIH_vs_normal_W0:
+        {factor: sample_type, test: PIH, reference: normal, paired: true,
+         subset: {diagnosis: PIH, timepoint_weeks: 0}}
+      # 5: normal vs PIH, 16 weeks (P012 has no week-16 cores)
+      PIH_vs_normal_W16:
+        {factor: sample_type, test: PIH, reference: normal, paired: true,
+         subset: {diagnosis: PIH, timepoint_weeks: 16}}
+      # 6: PIH, baseline vs 16 weeks (P012 dropped: baseline only)
+      PIH_W16_vs_W0:
+        {factor: timepoint_weeks, test: 16, reference: 0, paired: true,
+         subset: {sample_type: PIH}}
+      # 7, 8: melasma vs PIH lesions. Different patients, so unpaired, and diagnosis is
+      # confounded with patient / capture area
+      melasma_vs_PIH_W0:
+        {factor: sample_type, test: melasma, reference: PIH, paired: false,
+         subset: {timepoint_weeks: 0}}
+      melasma_vs_PIH_W16:
+        {factor: sample_type, test: melasma, reference: PIH, paired: false,
+         subset: {timepoint_weeks: 16}}
+  resources:
+    partition: "standard"
+    account: "sbsandme_lab"
+    make_adata:     {mem_mb: 32000,  cpus: 2,  runtime: 60}
+    combine:        {mem_mb: 128000, cpus: 4,  runtime: 180}
+    cluster_016:    {mem_mb: 128000, cpus: 8,  runtime: 480}
+    cluster_008:    {mem_mb: 128000, cpus: 16, runtime: 1440}  # 16 um peaked at 22 GB; 8 um has ~2.2x the bins
+    cluster_cell:   {mem_mb: 64000,  cpus: 8,  runtime: 240}
+    spatial_stats:  {mem_mb: 192000, cpus: 16, runtime: 720}
+    svg:            {mem_mb: 64000,  cpus: 8,  runtime: 240}
+    ccc:            {mem_mb: 128000, cpus: 16, runtime: 480}
+    image_features: {mem_mb: 96000,  cpus: 8,  runtime: 240}
+    spatial_plots:  {mem_mb: 32000,  cpus: 2,  runtime: 60}
+    de:             {mem_mb: 32000,  cpus: 4,  runtime: 120}
 
 # scVI integration parameters
 min_genes: 200

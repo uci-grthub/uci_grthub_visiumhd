@@ -1,7 +1,7 @@
 # Pixi environment for Space Ranger (Visium HD).
 #
 # Space Ranger is proprietary and is not published on conda-forge or bioconda,
-# so this manifest installs nothing; it only puts the cluster-wide install on
+# so this manifest installs nothing; it only puts the install in $TOOLS on
 # PATH via activation. There is no `spaceranger` module on HPC3.
 #
 # Kept as a standalone manifest rather than a feature of the workspace
@@ -20,5 +20,5 @@ version = "0.1.0"
 [dependencies]
 
 [activation.env]
-SPACERANGER_HOME = "/dfs8/commondata/spaceranger/spaceranger-3.1.2"
-PATH = "/dfs8/commondata/spaceranger/spaceranger-3.1.2:$PATH"
+SPACERANGER_HOME = "/dfs9/ucightf-lab/kstachel/TOOLS/spaceranger-4.1.0"
+PATH = "/dfs9/ucightf-lab/kstachel/TOOLS/spaceranger-4.1.0:$PATH"
