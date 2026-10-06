@@ -176,6 +176,8 @@ def main():
         subset, container, features=args.features, key_added="image_features",
         spot_scale=args.spot_scale, scale=args.scale, n_jobs=args.n_jobs,
         show_progress_bar=False,
+        # the subset still carries every capture area in uns['spatial']
+        library_id=args.run_id,
     )
 
     # calculate_image_features stores a DataFrame already indexed by barcode

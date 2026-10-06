@@ -189,8 +189,11 @@ def main():
     os.makedirs(args.figure_dir, exist_ok=True)
 
     print(f"nhood_enrichment ({args.n_perms} permutations)")
+    # threading, not loky: loky hands workers the graph as read-only memmaps, which
+    # squidpy's numba kernel (signature over writable uint32 arrays) rejects
     sq.gr.nhood_enrichment(adata, cluster_key=args.cluster_key, n_perms=args.n_perms,
-                           n_jobs=args.n_jobs, seed=args.seed, show_progress_bar=False)
+                           n_jobs=args.n_jobs, seed=args.seed, show_progress_bar=False,
+                           backend="threading")
     result = adata.uns[f"{args.cluster_key}_nhood_enrichment"]
     write_matrix(result["zscore"], labels,
                  os.path.join(args.results_dir, "nhood_enrichment_zscore.csv"),
