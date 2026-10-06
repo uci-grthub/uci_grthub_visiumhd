@@ -19,8 +19,8 @@ import scanpy as sc
 import squidpy as sq
 
 #: obs columns worth a panel, when present.
-DEFAULT_KEYS = ("leiden", "core_id", "condition", "timepoint_weeks", "broad_cell_type",
-                "total_counts")
+DEFAULT_KEYS = ("leiden", "domain", "core_id", "condition", "timepoint_weeks",
+                "broad_cell_type", "total_counts")
 
 
 def plot_panels(adata, keys, library_key, size, ncols, panel_inches=5.0):

@@ -828,8 +828,12 @@ ALT_BATCH_KEYS = [k for k in BATCH_KEYS if k != PRIMARY_BATCH_KEY]
 
 
 # Rule: normalise, Harmony-integrate on the primary key of
-# squidpy.cluster.batch_keys, and cluster
+# squidpy.cluster.batch_keys, and cluster. Segmented cells only: bins are too
+# shallow to integrate (median 15 HVG counts per 16 um bin), so they take their
+# labels from the cells they overlap in squidpy_bin_labels instead
 rule squidpy_cluster:
+    wildcard_constraints:
+        level = "cell"
     input:
         script = "src/squidpy_cluster.py",
         combined = f"{SQUIDPY_DIR}/{{level}}/combined.h5ad"
@@ -842,9 +846,11 @@ rule squidpy_cluster:
         n_pcs = SQUIDPY.get("cluster", {}).get("n_pcs", 30),
         n_neighbors = squidpy_cluster_setting("n_neighbors", 15),
         resolution = squidpy_cluster_setting("resolution", 1.0),
+        min_dist = SQUIDPY.get("cluster", {}).get("umap_min_dist", 0.5),
         batch_key = PRIMARY_BATCH_KEY,
         hvg_batch = (lambda k: f"--hvg-batch-key {k}" if k else "")(
             SQUIDPY.get("cluster", {}).get("hvg_batch_key")),
+        min_hvg_counts = squidpy_cluster_setting("min_hvg_counts", 1),
         theta = SQUIDPY.get("cluster", {}).get("harmony_theta", 2.0),
         crosstab_dir = f"{SQUIDPY_RESULTS}/{{level}}/qc",
         cluster_key = SQUIDPY.get("cluster", {}).get("cluster_key", "leiden"),
@@ -871,8 +877,10 @@ rule squidpy_cluster:
             --n-pcs {params.n_pcs} \
             --n-neighbors {params.n_neighbors} \
             --resolution {params.resolution} \
+            --min-dist {params.min_dist} \
             --batch-key {params.batch_key} \
             {params.hvg_batch} \
+            --min-hvg-counts {params.min_hvg_counts} \
             --theta {params.theta} \
             --crosstab-dir {params.crosstab_dir} \
             --cluster-key {params.cluster_key} \
@@ -883,8 +891,10 @@ rule squidpy_cluster:
 # Rule: the same normalise-and-cluster once per every other key in
 # squidpy.cluster.batch_keys, each to its own object rather than a joint
 # correction, so the corrections can be compared (qc_<key>/cluster_by_* tables
-# against the primary's qc/ ones)
+# against the primary's qc/ ones). Cells only, as for squidpy_cluster
 rule squidpy_cluster_alt:
+    wildcard_constraints:
+        level = "cell"
     input:
         script = "src/squidpy_cluster.py",
         combined = f"{SQUIDPY_DIR}/{{level}}/combined.h5ad"
@@ -897,9 +907,11 @@ rule squidpy_cluster_alt:
         n_pcs = SQUIDPY.get("cluster", {}).get("n_pcs", 30),
         n_neighbors = squidpy_cluster_setting("n_neighbors", 15),
         resolution = squidpy_cluster_setting("resolution", 1.0),
+        min_dist = SQUIDPY.get("cluster", {}).get("umap_min_dist", 0.5),
         batch_key = lambda wildcards: wildcards.batch_key,
         hvg_batch = (lambda k: f"--hvg-batch-key {k}" if k else "")(
             SQUIDPY.get("cluster", {}).get("hvg_batch_key")),
+        min_hvg_counts = squidpy_cluster_setting("min_hvg_counts", 1),
         theta = SQUIDPY.get("cluster", {}).get("harmony_theta", 2.0),
         crosstab_dir = f"{SQUIDPY_RESULTS}/{{level}}/qc_{{batch_key}}",
         cluster_key = SQUIDPY.get("cluster", {}).get("cluster_key", "leiden"),
@@ -926,12 +938,138 @@ rule squidpy_cluster_alt:
             --n-pcs {params.n_pcs} \
             --n-neighbors {params.n_neighbors} \
             --resolution {params.resolution} \
+            --min-dist {params.min_dist} \
             --batch-key {params.batch_key} \
             {params.hvg_batch} \
+            --min-hvg-counts {params.min_hvg_counts} \
             --theta {params.theta} \
             --crosstab-dir {params.crosstab_dir} \
             --cluster-key {params.cluster_key} \
             {params.harmony} {params.subsample} > {log} 2>&1
+        """
+
+
+LABEL_TRANSFER = SQUIDPY.get("cluster", {}).get("label_transfer", {})
+
+
+def bin_labels_params(wildcards):
+    """Command-line flags shared by both bin label-transfer rules."""
+    cluster = SQUIDPY.get("cluster", {})
+    flags = [
+        f"--bin-size-um {int(wildcards.level[len('square_'):-len('um')])}",
+        f"--cluster-key {cluster.get('cluster_key', 'leiden')}",
+        f"--min-cell-fraction {LABEL_TRANSFER.get('min_cell_fraction', 0.25)}",
+        f"--n-top-genes {cluster.get('n_top_genes', 2000)}",
+    ]
+    flags.append(f"--theta {cluster.get('harmony_theta', 2.0)}")
+    flags.append(f"--library-key {SQUIDPY.get('library_key', 'run_id')}")
+    domains = SQUIDPY.get("domains", {})
+    if domains.get("enabled", False) and wildcards.level in domains.get(
+            "levels", [f"square_{HEAVY_BIN}um"]):
+        flags += [
+            "--domains",
+            f"--domain-n-rings {domains.get('n_rings', 2)}",
+            f"--domain-lambda {domains.get('lambda', 0.8)}",
+            f"--domain-n-pcs {domains.get('n_pcs', 30)}",
+            f"--domain-n-neighbors {domains.get('n_neighbors', 30)}",
+            f"--domain-resolution {domains.get('resolution', 0.3)}",
+        ]
+    transfer_keys = LABEL_TRANSFER.get("transfer_keys", [])
+    if transfer_keys:
+        flags.append("--transfer-keys " + " ".join(transfer_keys))
+    if cluster.get("hvg_batch_key"):
+        flags.append(f"--hvg-batch-key {cluster['hvg_batch_key']}")
+    return " ".join(flags)
+
+
+BARCODE_MAPPINGS = [f"{OUTPUT_DIR}/spaceranger/{s}/outs/barcode_mappings.parquet"
+                    for s in sorted(VISIUMHD_SAMPLES)]
+
+
+# Rule: label each bin with the clusters of the segmented cells it overlaps, from the
+# primary cell integration. Writes the bin-level clustered.h5ad every downstream rule
+# reads, with the same X/.raw a directly clustered bin object had
+rule squidpy_bin_labels:
+    wildcard_constraints:
+        level = r"square_\d{3}um"
+    input:
+        script = "src/squidpy_bin_labels.py",
+        cluster_module = "src/squidpy_cluster.py",
+        combined = f"{SQUIDPY_DIR}/{{level}}/combined.h5ad",
+        cell_clustered = f"{SQUIDPY_DIR}/cell/clustered.h5ad",
+        barcode_mappings = BARCODE_MAPPINGS
+    output:
+        clustered = f"{SQUIDPY_DIR}/{{level}}/clustered.h5ad",
+        summary = f"{SQUIDPY_RESULTS}/{{level}}/qc/label_transfer.csv"
+    params:
+        crosstab_dir = f"{SQUIDPY_RESULTS}/{{level}}/qc",
+        batch_key = PRIMARY_BATCH_KEY,
+        flags = bin_labels_params
+    threads: squidpy_cluster_resource("cpus", 8)
+    resources:
+        mem_mb = squidpy_cluster_resource("mem_mb", 128000),
+        cpus = squidpy_cluster_resource("cpus", 8),
+        runtime = squidpy_cluster_resource("runtime", 480),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_bin_labels_{{level}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        export PYTHONPATH=src:${{PYTHONPATH:-}}
+        {SQUIDPY_PYTHON} {input.script} \
+            --input {input.combined} \
+            --cell-clustered {input.cell_clustered} \
+            --barcode-mappings {input.barcode_mappings} \
+            --output {output.clustered} \
+            --summary-csv {output.summary} \
+            --crosstab-dir {params.crosstab_dir} \
+            --batch-key {params.batch_key} \
+            {params.flags} > {log} 2>&1
+        """
+
+
+# Rule: the same transfer from each alternative cell integration, so every bin-level
+# clustered_<key>.h5ad carries the labels of the matching cell-level run
+rule squidpy_bin_labels_alt:
+    wildcard_constraints:
+        level = r"square_\d{3}um"
+    input:
+        script = "src/squidpy_bin_labels.py",
+        cluster_module = "src/squidpy_cluster.py",
+        combined = f"{SQUIDPY_DIR}/{{level}}/combined.h5ad",
+        cell_clustered = f"{SQUIDPY_DIR}/cell/clustered_{{batch_key}}.h5ad",
+        barcode_mappings = BARCODE_MAPPINGS
+    output:
+        clustered = f"{SQUIDPY_DIR}/{{level}}/clustered_{{batch_key}}.h5ad",
+        summary = f"{SQUIDPY_RESULTS}/{{level}}/qc_{{batch_key}}/label_transfer.csv"
+    params:
+        crosstab_dir = f"{SQUIDPY_RESULTS}/{{level}}/qc_{{batch_key}}",
+        batch_key = lambda wildcards: wildcards.batch_key,
+        flags = bin_labels_params
+    threads: squidpy_cluster_resource("cpus", 8)
+    resources:
+        mem_mb = squidpy_cluster_resource("mem_mb", 128000),
+        cpus = squidpy_cluster_resource("cpus", 8),
+        runtime = squidpy_cluster_resource("runtime", 480),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/squidpy_bin_labels_{{level}}_{{batch_key}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        export PYTHONPATH=src:${{PYTHONPATH:-}}
+        {SQUIDPY_PYTHON} {input.script} \
+            --input {input.combined} \
+            --cell-clustered {input.cell_clustered} \
+            --barcode-mappings {input.barcode_mappings} \
+            --output {output.clustered} \
+            --summary-csv {output.summary} \
+            --crosstab-dir {params.crosstab_dir} \
+            --batch-key {params.batch_key} \
+            {params.flags} > {log} 2>&1
         """
 
 

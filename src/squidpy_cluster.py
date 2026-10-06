@@ -57,12 +57,18 @@ UMAP_KEYS = ("sample_id", "run_id", "condition", "timepoint_weeks", "patient",
 CROSSTAB_KEYS = ("condition", "timepoint_weeks", "run_id", "core_id", "patient")
 
 
-def preprocess(adata, n_top_genes, batch_key):
+def preprocess(adata, n_top_genes, batch_key, min_hvg_counts=1, report_key="sample_id"):
     """Normalise, log, select HVGs and run PCA. Raw counts stay in layers['counts'].
 
     ``batch_key`` is the HVG batch, which is None by default and is *not* the Harmony
     batch: per-batch selection lets a near-empty section contribute noise genes to the
     2000, and several sections here run at a median of a few counts per bin.
+
+    Bins with fewer than ``min_hvg_counts`` raw counts across the HVGs are dropped before
+    scaling. A bin with no HVG counts scales to the same row as every other such bin, so
+    they share one point in PCA; Harmony then offsets that point once per batch, and UMAP
+    draws each copy as a tight island ringing the main body (1,853 bins at 16 um, all at
+    one X_pca position, spread to 127 positions by the sample_id correction).
     """
     if "counts" not in adata.layers:
         adata.layers["counts"] = adata.X.copy()
@@ -79,6 +85,16 @@ def preprocess(adata, n_top_genes, batch_key):
     print(f"{int(adata.var['highly_variable'].sum())} highly variable genes")
 
     adata = adata[:, adata.var["highly_variable"]].copy()
+
+    hvg_counts = np.asarray(adata.layers["counts"].sum(axis=1)).ravel()
+    keep = hvg_counts >= min_hvg_counts
+    print(f"min_hvg_counts {min_hvg_counts}: dropping {int((~keep).sum())} of "
+          f"{adata.n_obs} bins ({(~keep).mean():.4f}) with too few HVG counts")
+    if (~keep).any() and report_key in adata.obs:
+        dropped = adata.obs.loc[~keep, report_key].value_counts()
+        print(f"  dropped by {report_key}: {dropped[dropped > 0].to_dict()}")
+    adata = adata[keep].copy()
+
     sc.pp.scale(adata, max_value=10)
     sc.pp.pca(adata, n_comps=50, svd_solver="arpack")
     return adata
@@ -197,12 +213,18 @@ def main():
     parser.add_argument("--n-pcs", type=int, default=30)
     parser.add_argument("--n-neighbors", type=int, default=15)
     parser.add_argument("--resolution", type=float, default=1.0)
+    parser.add_argument("--min-dist", type=float, default=0.5,
+                        help="UMAP min_dist; lower packs clusters tighter on the plot "
+                             "without changing the graph or Leiden")
     parser.add_argument("--batch-key", nargs="+", default=["sample_id"],
                         help="obs column(s) Harmony integrates on, space-separated")
     parser.add_argument("--hvg-batch-key", default=None,
                         help="batch key for highly_variable_genes; omit to select over "
                              "the whole object, which keeps near-empty sections from "
                              "contributing noise genes")
+    parser.add_argument("--min-hvg-counts", type=int, default=1,
+                        help="drop bins with fewer raw counts than this across the HVGs; "
+                             "bins with none collapse to one point and form UMAP islands")
     parser.add_argument("--theta", type=float, default=2.0,
                         help="Harmony diversity penalty; lower corrects more gently")
     parser.add_argument("--max-iter-harmony", type=int, default=20)
@@ -223,7 +245,8 @@ def main():
         sc.pp.subsample(adata, n_obs=args.subsample, random_state=args.seed)
         print(f"Subsampled to {adata.n_obs} bins")
 
-    adata = preprocess(adata, args.n_top_genes, args.hvg_batch_key)
+    adata = preprocess(adata, args.n_top_genes, args.hvg_batch_key,
+                       args.min_hvg_counts, args.batch_key[0])
 
     use_rep = "X_pca"
     if args.use_harmony:
@@ -232,7 +255,7 @@ def main():
     sc.pp.neighbors(adata, n_neighbors=args.n_neighbors, n_pcs=args.n_pcs,
                     use_rep=use_rep, random_state=args.seed)
     report_graph_components(adata, args.crosstab_dir)
-    sc.tl.umap(adata, random_state=args.seed)
+    sc.tl.umap(adata, min_dist=args.min_dist, random_state=args.seed)
     sc.tl.leiden(adata, resolution=args.resolution, key_added=args.cluster_key,
                  flavor="igraph", n_iterations=2, directed=False,
                  random_state=args.seed)

@@ -159,6 +159,8 @@ squidpy:
     # 1.0 gives 60, and 0.5 gives 45 (31 of them substantial, largest 19% of bins) with
     # the fewest bins -- 679, 0.5% -- left in clusters under 500 bins.
     resolution: 0.5
+    # UMAP only: lower packs clusters tighter on the plot; graph and Leiden unchanged
+    umap_min_dist: 0.1
     # Per-level overrides for the two settings whose meaning changes with bin size.
     # Both fall back to the values above for a level not listed. 8 um is pending the
     # n_neighbors sweep: at 30 its graph has 61 components against 1 at 16 um.
@@ -194,9 +196,44 @@ squidpy:
     # Select HVGs over the whole object rather than per batch: with near-empty sections
     # in the mix, per-batch selection lets them contribute noise genes to the 2000.
     hvg_batch_key: null
+    # Drop bins with fewer raw counts than this across the selected HVGs, before scaling.
+    # A bin with no HVG counts scales to one shared row, so all such bins sit on a single
+    # PCA point; Harmony offsets it once per batch and UMAP draws each copy as an island
+    # ringing the main body. Before this filter they made up 91-98% of those islands at
+    # 16 and 8 um: 1,853 bins (1.5%) at 16 um, 10,456 (3.0%) at 8 um, and 2 cells.
+    # Bins with one or two counts (mostly a single FLG read at 8 um) sit just inside;
+    # raise per level if they still island.
+    min_hvg_counts: 1
+    min_hvg_counts_per_level: {}
+    # Only the cell level is integrated and clustered. Bins are too shallow to integrate
+    # (median 15 HVG counts per 16 um bin): Harmony left the bin embeddings ordered by
+    # depth, with islands of empty bins around them. Each bin instead takes the label of
+    # the segmented cells covering most of its area (outs/barcode_mappings.parquet), from
+    # the cell run with the same batch key, so bin and cell clusters share one meaning.
+    # The *_per_level cluster settings and subsample_008 therefore only reach the cell
+    # level now.
+    label_transfer:
+      # bins whose labelled-cell area is below this share of the bin are "unassigned"
+      # (acellular matrix, or cells dropped by cell-level QC)
+      min_cell_fraction: 0.25
+      # further cell annotations to carry over alongside cluster_key, when present
+      transfer_keys: ["broad_cell_type", "coarse_cell_type"]
     cluster_key: "leiden"
     use_harmony: true
     subsample_008: 800000  # cap for the 8 um object; null to cluster every bin
+  # Tissue domains for bins, alongside the transferred cell labels: BANKSY-style, each
+  # bin's scaled HVG expression joined to its spatial neighbours' mean, then PCA,
+  # Harmony on the same batch key as the cell run, and Leiden. Unlike the transferred
+  # labels this covers bins no cell reaches (62% of 16 um bins). Written as obs
+  # "domain" in the bin-level clustered objects and drawn in the spatial panels.
+  domains:
+    enabled: true
+    levels: ["square_016um"]
+    n_rings: 2          # Moore rings at 16 um: 24 neighbours, ~80 um across
+    lambda: 0.8         # neighbourhood weight; BANKSY's domain-finding default
+    n_pcs: 30
+    n_neighbors: 30
+    resolution: 0.3     # domains are coarse; raise for finer regions
   spatial:
     coord_type: "grid"
     n_neighs: 8           # Moore neighbourhood on the HD square lattice, not hex 6
@@ -234,7 +271,7 @@ squidpy:
   # log2FC is test / reference. subset filters on sample_metadata columns first, then
   # only cores at test or reference of factor enter. paired: ~ patient_id + factor.
   de:
-    levels: ["square_016um", "cell"]   # the 8 um clustered.h5ad is subsampled, so most bins lack a cluster
+    levels: ["square_016um", "cell"]
     sample_key: "core_index"
     cluster_key: "leiden"
     min_obs_per_pseudobulk: 50         # drop sparse core x cluster pseudobulks
