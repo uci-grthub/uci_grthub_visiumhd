@@ -156,8 +156,9 @@ gene a median bin has 64 counts.
 Changing the selection method helps more than changing the number:
 `flavor="seurat_v3"` (ranks on raw counts) or Pearson-residual HVG selection
 picks higher-expressed, informative genes, so each bin carries more counts at
-the same 2000. The cell level uses the same `seurat` flavour today, so the same
-change may help there too.
+the same 2000. With Pearson residuals, 3000 HVGs and a floor of 25, the median rises
+to 28 (see the comparison below). The cell level uses the same `seurat` flavour today,
+and `squidpy.cluster.hvg_flavor` can switch it.
 
 ### Both together
 
@@ -168,6 +169,81 @@ still describe parts of cells rather than whole cells. The current design gets
 more out of 8 um by using its resolution for area-weighted label transfer, and
 uses neighbourhood smoothing at 16 um (domains) for regions defined directly
 from bins.
+
+### Four recipes compared at 8 um
+
+To find the best option if clustering *had* to happen at 8 um, four recipes were
+run on the same 8 um object (2026-10-08). All four integrate on `sample_id`, use
+kNN 100 on 30 dimensions, Leiden at resolution 0.5 and UMAP `min_dist` 0.1.
+
+| Arm | Filter | Features | Integration |
+|---|---|---|---|
+| baseline | floor 10, drop zero-HVG bins | 2000 `seurat` HVGs, log1p + scale, PCA 50 | Harmony (theta 2) |
+| pearson | floor 25 | 3000 Pearson-residual HVGs (selected per `sample_id`); PCA 50 on analytic Pearson residuals, with depth from all genes | Harmony |
+| pearson_banksy | floor 25 | as pearson, joined to the mean over two rings of neighbours (24 bins), BANKSY cell-typing lambda 0.2 | Harmony |
+| scvi | floor 25 | same 3000 HVGs, raw counts | scVI (negative binomial, 30 latent dimensions, GPU) |
+
+The floor of 25 keeps 270,642 of 350,892 bins (77%). With 3000 Pearson HVGs a
+median bin has 28 HVG counts, against 8 for the baseline, and only 81 bins have
+none (baseline: 10,456).
+
+Each arm was scored against the cell-level clusters transferred onto the same
+bins. That transfer uses each bin's overlap with segmented cells, independently
+of its own expression. Only bins with `leiden_purity` of at least 0.75 were
+scored, 138,000–147,000 per arm, so acellular areas are not tested.
+
+| | baseline | pearson | pearson_banksy | scvi |
+|---|---|---|---|---|
+| Bins | 340,436 | 270,561 | 270,561 | 270,561 |
+| Leiden clusters | 32 | 20 | 15 | 7 |
+| Largest cluster | 9% | 15% | 25% | 56% |
+| kNN graph components | 1 | 1 | 1 | 1 |
+| ARI / NMI vs cell clusters | 0.17 / 0.28 | 0.33 / 0.50 | **0.44 / 0.56** | 0.28 / 0.50 |
+| ARI / NMI vs `broad_cell_type` | 0.10 / 0.18 | 0.16 / 0.34 | 0.19 / 0.38 | 0.21 / 0.39 |
+| Largest \|Spearman\| of log depth with dimensions 1–5 | 0.27 | 0.41 | 0.34 | **0.16** |
+| Share of log-depth variance explained by cluster | 0.30 | 0.48 | 0.49 | 0.32 |
+| kNN neighbours from the same sample (0.058 if fully mixed) | 0.12 | 0.13 | 0.16 | 0.14 |
+| Clusters with >80% of bins from one sample | 0 | 0 | 2 | 1 |
+
+Agreement with the cell clusters barely changes when every arm is scored on
+the same 267,095 bins.
+
+- **baseline**: reproduces the problem. The UMAP is a starburst ordered by depth,
+  and the spatial maps are salt-and-pepper, with neighbouring bins in unrelated
+  clusters.
+- **pearson**: changing only the features roughly doubles agreement with the cell
+  clusters. Follicles, epidermal layers and dermis appear as spatially coherent
+  regions.
+- **pearson_banksy**: agrees best with the cell clusters, and most of its
+  clusters are 70–98% one cell cluster. It has three costs:
+  - Two clusters come from single samples: cluster 13 (1,609 bins, 99% one
+    sample) and cluster 14 (360 bins, 100% one sample). The 16 um domains
+    produced the same kind of sample-specific clusters.
+  - Mixing across samples is somewhat weaker.
+  - One 68,000-bin cluster at a median depth of 49 collects shallow dermis.
+- **scvi**: removes the most depth from the embedding, because it models library
+  size directly. But it leaves 56% of bins (shallow dermis, median depth 66) in a
+  single cluster. Training also stopped at the 60-epoch cap, so the model may be
+  under-fitted.
+
+Caveats on reading these scores:
+
+- The arms found different numbers of clusters at the same resolution, which
+  biases ARI, and each ran with a single seed.
+- Depth still separates clusters in the Pearson arms (0.48 of log-depth
+  variance), but part of that is biological: epidermis is deep and dermis
+  shallow. These scores cannot separate the two.
+
+**Conclusion.** If integration must happen at 8 um, use Pearson-residual
+features with neighbour smoothing (and a floor of about 25). That recipe is
+clearly better than the current one. Its clusters still describe roughly
+40 um neighbourhoods rather than single cells, and it agrees with cell clusters
+at ARI 0.44. Cell-level clustering with label transfer therefore remains the
+source of cell identity. Smoothed 8 um clusters are best read as
+finer-grained tissue domains.
+
+Untested: scVI clustered at a higher resolution, scVI trained for more epochs,
+and a sweep of lambda (0.2–0.5) and neighbour rings (1–2).
 
 ## Why segmented cells work
 
@@ -241,3 +317,8 @@ downstream rules read:
 - The island investigation (scripts, tables, highlighted UMAPs) and the
   8 um QC/HVG sweep (`qc_hvg_sweep.py`): `output/umap_islands/` (not tracked
   in git).
+- The 8 um recipe comparison: `output/umap_islands/compare_8um.py` and
+  `score_8um.py` (with `run_compare_8um*.sh`). Results, including
+  `summary.csv`, per-arm cluster tables, `umaps.png` and `spatial.png`, are in
+  `output/umap_islands/compare_8um/`. The plaid grid in `spatial.png` is
+  aliasing from drawing 8 um squares at low dpi, not a feature of the data.
