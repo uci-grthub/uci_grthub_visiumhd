@@ -326,6 +326,12 @@ squidpy:
     spatial_plots:  {mem_mb: 32000,  cpus: 2,  runtime: 60}
     de:             {mem_mb: 32000,  cpus: 4,  runtime: 120}
 
+# Project report (rule project_report): reportlab PDF, laid out after the bulk RNA-seq
+# report. The python needs reportlab, pandas and PyYAML; the squidpy env has no reportlab.
+report:
+  python: "/dfs9/ucightf-lab/kstachel/.conda/envs/snakemake_dfs/bin/python3"
+  author: "Kevin Stachelek"
+
 # scVI integration parameters
 min_genes: 200
 min_cells: 5

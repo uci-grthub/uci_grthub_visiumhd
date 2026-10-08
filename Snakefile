@@ -18,6 +18,8 @@ import json
 import os
 import re
 
+from snakemake import __version__ as SNAKEMAKE_VERSION
+
 # Load configuration
 configfile: "config.yaml"
 
@@ -492,6 +494,9 @@ def spaceranger_extra_args(wildcards, input):
         args.append(f"--custom-bin-size={bin_size}")
     return " ".join(args)
 
+
+# Rule: Space Ranger count for one Visium HD capture area: probe alignment, 2/8/16 um
+# binning, and cell segmentation and annotation from the H&E image
 rule spaceranger_count:
     input:
         transcriptome = SPACERANGER.get("transcriptome", ""),
@@ -1370,6 +1375,7 @@ SQUIDPY_DE = SQUIDPY.get("de", {})
 DE_COMPARISONS = SQUIDPY_DE.get("comparisons", {})
 DE_LEVELS = SQUIDPY_DE.get("levels", HEAVY_LEVELS)
 
+# Rule: pseudobulk differential expression for one comparison, whole core and per cluster
 rule squidpy_de:
     input:
         script = "src/squidpy_de.py",
@@ -1504,6 +1510,54 @@ rule squidpy_all:
         expand(f"{SQUIDPY_RESULTS}/{{level}}/de_{{batch_key}}/{{comparison}}/whole_core.csv",
                level=DE_LEVELS, comparison=sorted(DE_COMPARISONS),
                batch_key=ALT_BATCH_KEYS)
+
+
+# Rule: the project report -- references, software versions, what each step did and with
+# which settings, QC and DE summaries, the per-core sample sheet, and the rules that
+# produced the current outputs (read from Snakemake's records in .snakemake/metadata).
+# Laid out after the bulk RNA-seq project report. Depends on the Space Ranger and squidpy
+# targets so that it is written last; runs locally in a few seconds.
+REPORT = config.get("report", {})
+
+localrules: project_report
+
+rule project_report:
+    input:
+        script = "src/project_report.py",
+        spaceranger = rules.spaceranger_all.input,
+        squidpy = rules.squidpy_all.input,
+        sample_metadata = SAMPLE_METADATA
+    output:
+        pdf = f"{RESULTS_DIR}/VisiumHD_Project_Report.pdf"
+    params:
+        python = REPORT.get("python", "python3"),
+        author = REPORT.get("author", "Kevin Stachelek"),
+        pixi_list = f"{OUTPUT_DIR}/logs/project_report_squidpy_env.json",
+        workflow_files = ["Snakefile"] + sorted(glob.glob("rules/*.smk")),
+        spaceranger_runs = expand(f"{OUTPUT_DIR}/spaceranger/{{sample}}",
+                                  sample=sorted(VISIUMHD_SAMPLES)),
+        spaceranger_metrics = f"{RESULTS_DIR}/spaceranger_metrics_summary.csv",
+        transcriptome = SPACERANGER.get("transcriptome", ""),
+        probe_set = SPACERANGER.get("probe_set", ""),
+        snakemake_version = SNAKEMAKE_VERSION
+    log:
+        f"{OUTPUT_DIR}/logs/project_report.log"
+    shell:
+        """
+        pixi list --frozen --json --manifest-path {SQUIDPY_MANIFEST} > {params.pixi_list}
+        {params.python} {input.script} \
+            --config config.yaml \
+            --workflow-files {params.workflow_files} \
+            --spaceranger-runs {params.spaceranger_runs} \
+            --spaceranger-metrics {params.spaceranger_metrics} \
+            --transcriptome {params.transcriptome} \
+            --probe-set {params.probe_set} \
+            --pixi-list {params.pixi_list} \
+            --snakemake-version {params.snakemake_version} \
+            --git-commit "$(git describe --always --dirty --abbrev=7)" \
+            --author "{params.author}" \
+            --output {output.pdf} > {log} 2>&1
+        """
 
 
 # Rule: Generate multi-sample summary
