@@ -372,6 +372,13 @@ rule spaceranger_all:
         f"{RESULTS_DIR}/spaceranger_metrics_summary.csv"
 
 
+# Target rule: raster cell and nucleus label masks for every capture area
+rule segmentation_masks_all:
+    input:
+        expand(f"{OUTPUT_DIR}/segmentation_masks/{{sample}}_{{kind}}_mask.tif",
+               sample=sorted(VISIUMHD_SAMPLES), kind=["cell", "nucleus"])
+
+
 # Helper function to get FASTQ files for a sample
 def get_fastq_files(wildcards, read):
     """Get R1 or R2 FASTQ file for a sample"""
@@ -657,6 +664,46 @@ rule squidpy_make_adata:
             --run-id {wildcards.sample} \
             --output {output.adata} \
             --qc-figure {output.qc_figure} > {log} 2>&1
+        """
+
+
+# Rule: rasterise Space Ranger's segmentation polygons into label masks
+#
+# Space Ranger keeps the segmentation only as GeoJSON polygons. Masks are drawn on the
+# full-resolution H&E grid (the --image given to spaceranger count; only its shape is
+# read): pixel = cell_id, 0 = background, and a cell and its nucleus share the id.
+# Written outside outs/, which spaceranger_count deletes on a rerun. The nucleus GeoJSON
+# is a param rather than an input because spaceranger_count does not declare it.
+rule segmentation_masks:
+    input:
+        script = "src/segmentation_masks.py",
+        image = lambda wildcards: VISIUMHD_SAMPLES[wildcards.sample]["image"],
+        cell_geojson = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/segmented_outputs/cell_segmentations.geojson",
+        scalefactors = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/segmented_outputs/spatial/scalefactors_json.json"
+    output:
+        cell_mask = f"{OUTPUT_DIR}/segmentation_masks/{{sample}}_cell_mask.tif",
+        nucleus_mask = f"{OUTPUT_DIR}/segmentation_masks/{{sample}}_nucleus_mask.tif"
+    params:
+        nucleus_geojson = f"{OUTPUT_DIR}/spaceranger/{{sample}}/outs/segmented_outputs/nucleus_segmentations.geojson"
+    threads: 1
+    resources:
+        mem_mb = squidpy_resource("segmentation_masks", "mem_mb", 8000),
+        cpus = 1,
+        runtime = squidpy_resource("segmentation_masks", "runtime", 30),
+        partition = squidpy_partition(),
+        account = squidpy_account()
+    log:
+        f"{OUTPUT_DIR}/logs/segmentation_masks_{{sample}}.log"
+    shell:
+        """
+        export PYTHONNOUSERSITE=1
+        {SQUIDPY_PYTHON} {input.script} \
+            --image "{input.image}" \
+            --scalefactors {input.scalefactors} \
+            --cell-geojson {input.cell_geojson} \
+            --nucleus-geojson {params.nucleus_geojson} \
+            --cell-mask {output.cell_mask} \
+            --nucleus-mask {output.nucleus_mask} > {log} 2>&1
         """
 
 
