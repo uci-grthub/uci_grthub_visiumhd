@@ -176,6 +176,8 @@ def main():
                         help="labelled-cell area below this share of the bin -> unassigned")
     parser.add_argument("--n-top-genes", type=int, default=2000)
     parser.add_argument("--hvg-batch-key", default=None)
+    parser.add_argument("--hvg-flavor", default="seurat",
+                        choices=["seurat", "seurat_v3", "pearson_residuals"])
     parser.add_argument("--library-key", default="run_id",
                         help="obs column the spatial graph is built within")
     parser.add_argument("--domains", action="store_true",
@@ -248,7 +250,8 @@ def main():
 
     # same X / .raw / PCA as a directly clustered bin object; every bin is kept, since
     # nothing here embeds them
-    adata = preprocess(adata, args.n_top_genes, args.hvg_batch_key, min_hvg_counts=0)
+    adata = preprocess(adata, args.n_top_genes, args.hvg_batch_key, min_hvg_counts=0,
+                       hvg_flavor=args.hvg_flavor)
 
     write_crosstabs(adata, args.cluster_key, [args.batch_key], args.crosstab_dir)
 

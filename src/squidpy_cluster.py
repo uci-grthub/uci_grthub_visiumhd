@@ -57,7 +57,8 @@ UMAP_KEYS = ("sample_id", "run_id", "condition", "timepoint_weeks", "patient",
 CROSSTAB_KEYS = ("condition", "timepoint_weeks", "run_id", "core_id", "patient")
 
 
-def preprocess(adata, n_top_genes, batch_key, min_hvg_counts=1, report_key="sample_id"):
+def preprocess(adata, n_top_genes, batch_key, min_hvg_counts=1, report_key="sample_id",
+               hvg_flavor="seurat"):
     """Normalise, log, select HVGs and run PCA. Raw counts stay in layers['counts'].
 
     ``batch_key`` is the HVG batch, which is None by default and is *not* the Harmony
@@ -69,6 +70,14 @@ def preprocess(adata, n_top_genes, batch_key, min_hvg_counts=1, report_key="samp
     they share one point in PCA; Harmony then offsets that point once per batch, and UMAP
     draws each copy as a tight island ringing the main body (1,853 bins at 16 um, all at
     one X_pca position, spread to 127 positions by the sample_id correction).
+
+    ``hvg_flavor`` picks how the HVGs are ranked. ``seurat`` (dispersion on log-normalised
+    data) favours sparse, low-expressed genes: at the cell level its 2000 HVGs hold 11% of
+    counts, a median of 62 per cell. ``pearson_residuals`` and ``seurat_v3`` rank on raw
+    counts and hold 19-20% (107 and 78 per cell), and on 2026-10-08 Pearson residuals also
+    resolved mast cells and a TYRP1+ basal cluster (output/umap_islands/hvg_flavor_cells/).
+    The selection is the only change: normalisation, scaling and PCA stay log-based.
+    ``seurat_v3`` needs scikit-misc, which envs/squidpy does not carry.
     """
     if "counts" not in adata.layers:
         adata.layers["counts"] = adata.X.copy()
@@ -76,12 +85,19 @@ def preprocess(adata, n_top_genes, batch_key, min_hvg_counts=1, report_key="samp
     sc.pp.log1p(adata)
     adata.raw = adata
 
-    # seurat flavor on log-normalised data; batch-aware only when asked for
-    sc.pp.highly_variable_genes(
-        adata, n_top_genes=n_top_genes,
-        batch_key=batch_key if batch_key and batch_key in adata.obs else None,
-    )
-    print(f"HVG selection batch_key: {batch_key or 'none (whole object)'}")
+    # batch-aware only when asked for
+    hvg_batch = batch_key if batch_key and batch_key in adata.obs else None
+    if hvg_flavor == "pearson_residuals":
+        sc.experimental.pp.highly_variable_genes(
+            adata, n_top_genes=n_top_genes, flavor="pearson_residuals",
+            layer="counts", batch_key=hvg_batch)
+    elif hvg_flavor == "seurat_v3":
+        sc.pp.highly_variable_genes(adata, n_top_genes=n_top_genes, flavor="seurat_v3",
+                                    layer="counts", batch_key=hvg_batch)
+    else:
+        sc.pp.highly_variable_genes(adata, n_top_genes=n_top_genes, flavor="seurat",
+                                    batch_key=hvg_batch)
+    print(f"HVG flavor: {hvg_flavor}; batch_key: {batch_key or 'none (whole object)'}")
     print(f"{int(adata.var['highly_variable'].sum())} highly variable genes")
 
     adata = adata[:, adata.var["highly_variable"]].copy()
@@ -222,6 +238,9 @@ def main():
                         help="batch key for highly_variable_genes; omit to select over "
                              "the whole object, which keeps near-empty sections from "
                              "contributing noise genes")
+    parser.add_argument("--hvg-flavor", default="seurat",
+                        choices=["seurat", "seurat_v3", "pearson_residuals"],
+                        help="how HVGs are ranked; seurat_v3 needs scikit-misc")
     parser.add_argument("--min-hvg-counts", type=int, default=1,
                         help="drop bins with fewer raw counts than this across the HVGs; "
                              "bins with none collapse to one point and form UMAP islands")
@@ -246,7 +265,7 @@ def main():
         print(f"Subsampled to {adata.n_obs} bins")
 
     adata = preprocess(adata, args.n_top_genes, args.hvg_batch_key,
-                       args.min_hvg_counts, args.batch_key[0])
+                       args.min_hvg_counts, args.batch_key[0], args.hvg_flavor)
 
     use_rep = "X_pca"
     if args.use_harmony:

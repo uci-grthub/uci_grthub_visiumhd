@@ -855,6 +855,7 @@ rule squidpy_cluster:
         batch_key = PRIMARY_BATCH_KEY,
         hvg_batch = (lambda k: f"--hvg-batch-key {k}" if k else "")(
             SQUIDPY.get("cluster", {}).get("hvg_batch_key")),
+        hvg_flavor = squidpy_cluster_setting("hvg_flavor", "seurat"),
         min_hvg_counts = squidpy_cluster_setting("min_hvg_counts", 1),
         theta = SQUIDPY.get("cluster", {}).get("harmony_theta", 2.0),
         crosstab_dir = f"{SQUIDPY_RESULTS}/{{level}}/qc",
@@ -885,6 +886,7 @@ rule squidpy_cluster:
             --min-dist {params.min_dist} \
             --batch-key {params.batch_key} \
             {params.hvg_batch} \
+            --hvg-flavor {params.hvg_flavor} \
             --min-hvg-counts {params.min_hvg_counts} \
             --theta {params.theta} \
             --crosstab-dir {params.crosstab_dir} \
@@ -916,6 +918,7 @@ rule squidpy_cluster_alt:
         batch_key = lambda wildcards: wildcards.batch_key,
         hvg_batch = (lambda k: f"--hvg-batch-key {k}" if k else "")(
             SQUIDPY.get("cluster", {}).get("hvg_batch_key")),
+        hvg_flavor = squidpy_cluster_setting("hvg_flavor", "seurat"),
         min_hvg_counts = squidpy_cluster_setting("min_hvg_counts", 1),
         theta = SQUIDPY.get("cluster", {}).get("harmony_theta", 2.0),
         crosstab_dir = f"{SQUIDPY_RESULTS}/{{level}}/qc_{{batch_key}}",
@@ -946,6 +949,7 @@ rule squidpy_cluster_alt:
             --min-dist {params.min_dist} \
             --batch-key {params.batch_key} \
             {params.hvg_batch} \
+            --hvg-flavor {params.hvg_flavor} \
             --min-hvg-counts {params.min_hvg_counts} \
             --theta {params.theta} \
             --crosstab-dir {params.crosstab_dir} \
@@ -982,6 +986,8 @@ def bin_labels_params(wildcards):
     transfer_keys = LABEL_TRANSFER.get("transfer_keys", [])
     if transfer_keys:
         flags.append("--transfer-keys " + " ".join(transfer_keys))
+    flags.append("--hvg-flavor " + cluster.get("hvg_flavor_per_level", {}).get(
+        wildcards.level, cluster.get("hvg_flavor", "seurat")))
     if cluster.get("hvg_batch_key"):
         flags.append(f"--hvg-batch-key {cluster['hvg_batch_key']}")
     return " ".join(flags)
