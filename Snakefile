@@ -714,8 +714,9 @@ def squidpy_min_counts(wildcards):
     """Absolute count floor for one level, from squidpy.qc.min_counts_per_level.
 
     One number is not comparable across levels. An 8 um bin covers a quarter the area of
-    a 16 um bin, so the same floor is far stricter there: at min_counts 10, 16 um kept
-    127,421 of 185,921 bins (69%) against 350,892 of ~744,000 at 8 um (47%). Falls back
+    a 16 um bin, so the same floor is far stricter there: at min_counts 10 (with the MT
+    cap), 16 um kept 140,402 of 185,921 bins (76%) against 383,280 of 660,443 at 8 um
+    (58%); after the per-section trim, 127,421 (69%) and 350,892 (53%). Falls back
     to squidpy.qc.min_counts when a level is not listed.
     """
     qc = SQUIDPY.get("qc", {})

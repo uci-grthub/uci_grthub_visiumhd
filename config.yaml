@@ -105,8 +105,8 @@ squidpy:
     # and reflects genuinely uneven tissue quality rather than hiding it.
     min_counts: 10        # fallback for a level not listed below
     # One floor is not comparable across levels. An 8 um bin covers a quarter the area of
-    # a 16 um bin, so 10 counts is ~4x stricter there: it keeps 69% of 16 um bins but
-    # only 53% of 8 um bins, and costs 0.5% of the sequencing at 16 um against 1.9% at
+    # a 16 um bin, so 10 counts is ~4x stricter there: it keeps 76% of 16 um bins but
+    # only 58% of 8 um bins (69% and 53% after the per-section trim), and costs 0.5% of the sequencing at 16 um against 1.9% at
     # 8 um. These values equalise that cost at ~0.5%, which is also what scaling by area
     # gives (10 / 4 = 2.5). Cells are segmented objects with a median of 530 counts, so
     # the floor barely binds there at all.

@@ -6,13 +6,14 @@ Concatenate the per-capture-area Visium HD objects for one bin size and apply QC
 instead. Each input already carries its TMA core assignment and the per-core metadata
 (patient, condition, timepoint) from ``src/squidpy_make_adata.py``.
 
-Depth is filtered **relatively, per section**, not against an absolute floor. At 16 um
-the raw median depth runs 4 to 300 counts across the 24 sections, so a single
-``min_counts`` keeps 13% of TMA2_top-right against 83% of TMA4_top-left -- a 6.3x spread
-in retention -- and ``condition`` is nested inside section, which makes that an uneven
-filter on the contrast being tested. A per-section quantile trim keeps 0.80-0.90
-everywhere instead. No bin in any section has zero counts, so nothing absolute is needed
-to keep normalisation well-defined.
+Depth is filtered by a **low absolute floor, then relatively, per section**. At 16 um
+the raw median depth runs 4 to 300 counts across the 24 sections, so a high
+``min_counts`` (50) keeps 13% of TMA2_top-right against 83% of TMA4_top-left -- a 6.3x
+spread in retention -- and ``condition`` is nested inside section, which makes that an
+uneven filter on the contrast being tested. The floor is therefore kept low (10 counts,
+0.5% of the sequencing at 16 um) and only removes bins that are uninformative in every
+section: without it, bins under 10 counts fragment the kNN graph. A per-section quantile
+trim of what survives then keeps 0.90-0.95 of each section. See docs/section_qc.md.
 
 ``pct_counts_mt`` is kept as a filter but is a weak axis on this probe-based FFPE assay
 -- the 11 MT- probes in the panel do not report mitochondrial content the way a poly-A
@@ -83,8 +84,8 @@ LOW_COUNT = 10
 def quantile_trim(adata, group_key, metric, lower, upper):
     """Drop the tails of ``metric`` within each group, inclusive of the bounds.
 
-    The depth filter is relative rather than absolute because an absolute floor is a
-    different real stringency in every section: min_counts 50 kept 13% of
+    Beyond the low absolute floor, the depth filter is relative because an absolute
+    floor is a different real stringency in every section: min_counts 50 kept 13% of
     TMA2_top-right against 83% of TMA4_top-left, a 6.3x spread over a 75x spread in raw
     median depth (4 to 300 counts at 16 um). ``condition`` is nested inside section, so
     an unevenly applied filter is an uneven filter on the contrast being tested.
