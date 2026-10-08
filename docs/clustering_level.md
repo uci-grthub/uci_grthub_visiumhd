@@ -101,6 +101,74 @@ most bins that overlap labelled cells lie within a single cell cluster (median
 purity 1.0), so this matters less here than the depth problem. It is still
 why bins can describe *where* tissue is but not *which cell* it is.
 
+## Would stricter QC or more HVGs rescue the 8 um level?
+
+Not enough to change the decision. Both were measured on the 8 um object
+(`output/squidpy/square_008um/combined.h5ad`, 350,892 bins, median 64 total
+counts; 2026-10-08). The target is cell-like depth: a segmented cell has a
+median of 635 total and 62 HVG counts.
+
+### Stricter depth filtering
+
+Fraction of bins kept by an absolute total-count floor, overall, across the 24
+cores, and by the transferred `broad_cell_type`:
+
+| Min total counts | Kept | Range across cores | Epithelial | Fibroblast | Unassigned | Median of kept |
+|---|---|---|---|---|---|---|
+| 10 (current) | 100% | 100% | 100% | 100% | 100% | 64 |
+| 25 | 77% | 49–95% | 99% | 87% | 63% | 106 |
+| 50 | 57% | 24–77% | 96% | 66% | 34% | 186 |
+| 100 | 40% | 10–57% | 89% | 40% | 17% | 315 |
+| 200 | 27% | 4.5–43% | 78% | 16% | 10% | 485 |
+| 400 | 16% | 1.4–28% | 59% | 3.5% | 4.6% | 703 |
+
+Reaching cell-like depth needs a floor of about 200, which keeps 27% of bins.
+That remainder is mostly epidermis: 78% of epithelial bins survive against 16%
+of fibroblast bins, and almost none of the acellular dermis. Some cores lose
+95% of their bins while others keep 43%. How many bins survive then depends on
+each section's sequencing depth, and since every `sample_id` batch is a single
+condition x timepoint, that unevenness would show up as condition differences.
+The old `min_counts: 50` floor already showed this (87% of TMA2_top-right
+removed against 17% of TMA4_top-left; see `squidpy.qc` in `config.yaml`).
+
+### More HVGs
+
+HVG counts per bin as `n_top_genes` grows (genes ranked by the current
+`seurat` dispersion):
+
+| HVGs | Median HVG counts per bin | 90th percentile | Share of all counts | Bins with zero HVG counts | Bins with at least 30 |
+|---|---|---|---|---|---|
+| 500 | 0 | 4 | 1.0% | 53% | 1.3% |
+| 1,000 | 2 | 11 | 2.6% | 21% | 2.9% |
+| 2,000 (current) | 8 | 39 | 8.9% | 3.0% | 14% |
+| 3,000 | 12 | 59 | 12.5% | 1.2% | 24% |
+| 5,000 | 20 | 111 | 21% | 0.2% | 39% |
+| 8,000 | 34 | 229 | 40% | 0% | 54% |
+| all 16,828 | 64 | 620 | 100% | 0% | 71% |
+
+The current 2000 HVGs cover only 9% of all counts. The `seurat` flavour ranks
+genes by dispersion on log-normalised data, which favours sparse, low-expressed
+genes, so most bins catch almost nothing in the HVG set. Going to 5000 would
+remove nearly all the zero-HVG islands (0.2% of bins left) and raise the median
+to 20. But the extra genes carry less biological signal, and even with every
+gene a median bin has 64 counts.
+
+Changing the selection method helps more than changing the number:
+`flavor="seurat_v3"` (ranks on raw counts) or Pearson-residual HVG selection
+picks higher-expressed, informative genes, so each bin carries more counts at
+the same 2000. The cell level uses the same `seurat` flavour today, so the same
+change may help there too.
+
+### Both together
+
+A floor of 100 plus 5000 HVGs would embed about 40% of bins at roughly 50–60
+HVG counts each. That is cell-like depth, but with the epidermis bias above,
+and an 8 um bin covers 64 um², smaller than a cell, so its clusters would
+still describe parts of cells rather than whole cells. The current design gets
+more out of 8 um by using its resolution for area-weighted label transfer, and
+uses neighbourhood smoothing at 16 um (domains) for regions defined directly
+from bins.
+
 ## Why segmented cells work
 
 - **Depth.** Cells carry about four times the HVG counts of a 16 um bin, and
@@ -170,5 +238,6 @@ downstream rules read:
 - Domain composition: `results/squidpy/square_016um/qc*/domain_by_*.csv`.
 - Spatial panels with leiden, domain and cell type side by side:
   `results/squidpy/square_016um/spatial/*_panels.pdf`.
-- The island investigation (scripts, tables, highlighted UMAPs):
-  `output/umap_islands/` (not tracked in git).
+- The island investigation (scripts, tables, highlighted UMAPs) and the
+  8 um QC/HVG sweep (`qc_hvg_sweep.py`): `output/umap_islands/` (not tracked
+  in git).
