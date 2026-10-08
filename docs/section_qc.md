@@ -42,7 +42,7 @@ On the concatenated object:
 2. **Absolute floor**: `sc.pp.filter_cells(min_counts=...)`, with the value
    taken from `min_counts_per_level` (10 at every level).
 3. **`min_genes`**: 0, so this step is off. Counts and genes are collinear, and
-   one depth axis is enough.
+   one depth axis is enough (see [No gene-count filter](#no-gene-count-filter)).
 4. **Mitochondrial cap**: `pct_counts_mt <= 25`, which removes 0.55% of bins.
    This is a weak axis on this probe-based FFPE panel, whose 11 MT- probes do
    not track mitochondrial content the way poly-A capture does.
@@ -153,6 +153,90 @@ cells. At 16 um the top decile holds 63.7% of all UMIs in the experiment, at a
 median of 1,485 genes per bin, against 0.6% of UMIs for the bottom 30%.
 Trimming the top would throw away most of the signal.
 
+## No gene-count filter
+
+`min_genes` is 0 at every level. A gene threshold would remove almost exactly
+the bins the count filters already remove, and it would bias against the same
+cores and cell types. Measured on 2026-10-08 on the post-QC objects
+(`output/squidpy/<level>/clustered.h5ad`).
+
+### Genes and counts are nearly the same number
+
+On this probe-based assay, almost every UMI in a bin is a different gene:
+
+| Level | Median genes | Median UMIs per gene | Spearman, genes vs counts |
+|---|---|---|---|
+| 8 um | 60 | 1.07 | 0.998 |
+| 16 um | 108 | 1.11 | 0.999 |
+| Cell | 528 | 1.19 | 0.995 |
+
+A `min_genes` threshold is therefore a `min_counts` threshold under another name.
+
+### What extra thresholds would remove
+
+These fractions are on top of the current QC. "Worst core" is the lowest
+retention of any core. From the second row of each level onwards, that core is
+TMA2_top-right (M007_pigmented_W0); at the lowest threshold it is
+TMA3_bottom-right. The cell-type columns use `broad_cell_type`, transferred
+from cells for the bin levels.
+
+| Level | `min_genes` | Kept | Worst core | Epithelial | Fibroblast | No cell overlap | Normal / pigmented | UMIs lost |
+|---|---|---|---|---|---|---|---|---|
+| 8 um | 10 | 99.9% | 99% | 100% | 100% | 99.9% | 100 / 99.9% | 0.0% |
+| 8 um | 15 | 93% | 74% | 99.7% | 97% | 89% | 94 / 92% | 0.5% |
+| 8 um | 20 | 83% | 57% | 99% | 91% | 72% | 85 / 81% | 1.3% |
+| 8 um | 30 | 70% | 39% | 98% | 81% | 52% | 72 / 67% | 2.9% |
+| 8 um | 50 | 55% | 23% | 95% | 64% | 32% | 57 / 52% | 5.9% |
+| 16 um | 15 | 98% | 85% | 100% | 99.8% | 96% | 99 / 96% | 0.1% |
+| 16 um | 25 | 86% | 60% | 99.9% | 98% | 79% | 90 / 83% | 0.5% |
+| 16 um | 40 | 75% | 40% | 99.6% | 95% | 61% | 78 / 70% | 1.2% |
+| 16 um | 60 | 64% | 28% | 99% | 90% | 46% | 68 / 60% | 2.1% |
+| 16 um | 100 | 52% | 17% | 98% | 78% | 30% | 56 / 47% | 3.9% |
+| Cell | 50 | 98% | 85% | 99% | 97% | – | 99.5 / 97% | 0.1% |
+| Cell | 100 | 93% | 65% | 98% | 85% | – | 97 / 87% | 0.5% |
+| Cell | 150 | 86% | 45% | 96% | 74% | – | 93 / 78% | 1.3% |
+| Cell | 200 | 81% | 33% | 94% | 64% | – | 89 / 71% | 2.4% |
+| Cell | 300 | 70% | 17% | 89% | 47% | – | 80 / 59% | 5.3% |
+
+The losses are small in UMIs but uneven in what they remove. Once a threshold
+starts to bite, it removes the shallow cores, fibroblasts and bins with no cell
+overlap first, and pigmented cores faster than normal ones. That is the same
+unevenness that ruled out the old `min_counts: 50` floor. The scRNA-seq
+convention of 200 genes per cell would drop 36% of fibroblasts and two thirds
+of TMA2_top-right.
+
+### Low-complexity cells are cornified keratinocytes
+
+A gene filter could add something new by catching observations with *fewer
+genes than their counts predict*, which flags degraded or ambient-dominated
+droplets in scRNA-seq. Here those outliers are real tissue. 1,025 cells fall
+more than 3 SD below the log-genes vs log-counts trend:
+
+- They are deep, not shallow: median 2,804 counts against 629 overall.
+- One gene makes up a median of 16% of their counts, against 2% for other
+  cells.
+- That gene is usually FLG, then LOR, FLG2, KRTDAP, KRT2, DMKN, ASPRV1, CDSN and
+  LCE1C, which mark the granular and cornified layers.
+- 83% are `broad_cell_type` Epithelial cell.
+
+A complexity filter would delete the cornified layer.
+
+### If a gene filter is required anyway
+
+If a reviewer or a convention requires a gene threshold, set it at the level
+the count floor already implies, where it removes at most about 2% and does
+not change which cores or cell types lose observations:
+
+| Level | `min_genes` | Kept |
+|---|---|---|
+| 8 um | 10 | 99.9% |
+| 16 um | 15 | 98% |
+| Cell | 50 | 98% |
+
+`squidpy.qc.min_genes` is a single value applied to every level. Unlike
+`min_counts`, it has no `min_genes_per_level` form, so using these three values
+together would need that option added to the Snakefile first.
+
 ## Outcome
 
 Retention is the fraction of each section's bins kept through all steps:
@@ -224,6 +308,8 @@ gate and the per-section kept range.
   names the affected patient pairing, not by raising the gate.
 - `quantile_trim.enabled: false` turns off the relative trim. `lower` sets its
   stringency.
+- `min_genes` is deliberately 0; see [No gene-count filter](#no-gene-count-filter)
+  for the cost of raising it.
 - Changing `min_counts_per_level` at 8 um changes graph connectivity, not just
   depth. See `docs/clustering_level.md` for the 8 um floor sweep (floors of 25
   to 400).
