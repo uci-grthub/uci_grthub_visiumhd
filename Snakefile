@@ -904,6 +904,7 @@ rule squidpy_cluster:
         hvg_batch = (lambda k: f"--hvg-batch-key {k}" if k else "")(
             SQUIDPY.get("cluster", {}).get("hvg_batch_key")),
         hvg_flavor = squidpy_cluster_setting("hvg_flavor", "seurat"),
+        normalization = squidpy_cluster_setting("normalization", "log"),
         min_hvg_counts = squidpy_cluster_setting("min_hvg_counts", 1),
         theta = SQUIDPY.get("cluster", {}).get("harmony_theta", 2.0),
         crosstab_dir = f"{SQUIDPY_RESULTS}/{{level}}/qc",
@@ -935,6 +936,7 @@ rule squidpy_cluster:
             --batch-key {params.batch_key} \
             {params.hvg_batch} \
             --hvg-flavor {params.hvg_flavor} \
+            --normalization {params.normalization} \
             --min-hvg-counts {params.min_hvg_counts} \
             --theta {params.theta} \
             --crosstab-dir {params.crosstab_dir} \
@@ -967,6 +969,7 @@ rule squidpy_cluster_alt:
         hvg_batch = (lambda k: f"--hvg-batch-key {k}" if k else "")(
             SQUIDPY.get("cluster", {}).get("hvg_batch_key")),
         hvg_flavor = squidpy_cluster_setting("hvg_flavor", "seurat"),
+        normalization = squidpy_cluster_setting("normalization", "log"),
         min_hvg_counts = squidpy_cluster_setting("min_hvg_counts", 1),
         theta = SQUIDPY.get("cluster", {}).get("harmony_theta", 2.0),
         crosstab_dir = f"{SQUIDPY_RESULTS}/{{level}}/qc_{{batch_key}}",
@@ -998,6 +1001,7 @@ rule squidpy_cluster_alt:
             --batch-key {params.batch_key} \
             {params.hvg_batch} \
             --hvg-flavor {params.hvg_flavor} \
+            --normalization {params.normalization} \
             --min-hvg-counts {params.min_hvg_counts} \
             --theta {params.theta} \
             --crosstab-dir {params.crosstab_dir} \
@@ -1031,11 +1035,25 @@ def bin_labels_params(wildcards):
             f"--domain-n-neighbors {domains.get('n_neighbors', 30)}",
             f"--domain-resolution {domains.get('resolution', 0.3)}",
         ]
+    bin_clustering = SQUIDPY.get("bin_clustering", {})
+    if bin_clustering.get("enabled", False) and wildcards.level in bin_clustering.get(
+            "levels", []):
+        flags += [
+            "--bin-cluster",
+            f"--bin-cluster-n-rings {bin_clustering.get('n_rings', 2)}",
+            f"--bin-cluster-lambda {bin_clustering.get('lambda', 0.2)}",
+            f"--bin-cluster-n-pcs {bin_clustering.get('n_pcs', 30)}",
+            f"--bin-cluster-n-neighbors {bin_clustering.get('n_neighbors', 100)}",
+            f"--bin-cluster-resolution {bin_clustering.get('resolution', 0.5)}",
+            f"--bin-cluster-min-counts {bin_clustering.get('min_counts', 25)}",
+        ]
     transfer_keys = LABEL_TRANSFER.get("transfer_keys", [])
     if transfer_keys:
         flags.append("--transfer-keys " + " ".join(transfer_keys))
     flags.append("--hvg-flavor " + cluster.get("hvg_flavor_per_level", {}).get(
         wildcards.level, cluster.get("hvg_flavor", "seurat")))
+    flags.append("--normalization " + cluster.get("normalization_per_level", {}).get(
+        wildcards.level, cluster.get("normalization", "log")))
     if cluster.get("hvg_batch_key"):
         flags.append(f"--hvg-batch-key {cluster['hvg_batch_key']}")
     return " ".join(flags)

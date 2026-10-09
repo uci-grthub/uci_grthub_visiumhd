@@ -1,7 +1,10 @@
 # Why clustering runs on segmented cells, not 8 or 16 um bins
 
 Decided 2026-10-06. Measurements below are from the integrations run that day on
-the six capture areas (24 TMA cores, 22 `sample_id` batches, 6 patients).
+the six capture areas (24 TMA cores, 22 `sample_id` batches, 6 patients), which
+used log-normalised, scaled `seurat` HVGs (2000). On 2026-10-08 the pipeline moved
+to SCTransform-style Pearson residuals on 3000 HVGs and gained a direct 8 um
+clustering; see [Current recipe](#current-recipe-pearson-residuals-3000-hvgs).
 
 ## Summary
 
@@ -157,8 +160,8 @@ Changing the selection method helps more than changing the number:
 `flavor="seurat_v3"` (ranks on raw counts) or Pearson-residual HVG selection
 picks higher-expressed, informative genes, so each bin carries more counts at
 the same 2000. With Pearson residuals, 3000 HVGs and a floor of 25, the median rises
-to 28 (see the comparison below). The cell level uses the same `seurat` flavour today,
-and `squidpy.cluster.hvg_flavor` can switch it.
+to 28 (see the comparison below). Since 2026-10-08 every level selects 3000
+Pearson-residual HVGs.
 
 ### Both together
 
@@ -245,18 +248,87 @@ finer-grained tissue domains.
 Untested: scVI clustered at a higher resolution, scVI trained for more epochs,
 and a sweep of lambda (0.2–0.5) and neighbour rings (1–2).
 
+## Current recipe: Pearson residuals, 3000 HVGs
+
+From 2026-10-08 (`squidpy.cluster` in `config.yaml`):
+
+- `hvg_flavor: pearson_residuals`, `n_top_genes: 3000`, selected over the whole
+  object.
+- `normalization: pearson`. PCA runs on analytic Pearson residuals of the raw
+  HVG counts (`pearson_residuals` in `src/squidpy_cluster.py`): the
+  SCTransform model with one overdispersion (theta 100) for all genes, depth
+  from all genes, clipped at sqrt(n). This replaces log1p + scaling. R
+  `sctransform` was not used; it fits a regularised theta per gene, needs a
+  separate R environment and is slow at 350,000 bins. `.raw` stays
+  log-normalised, so markers, DE and plots are unchanged in kind.
+- Cells and both bin levels use it. At 8 um, bins are also clustered directly
+  (`squidpy.bin_clustering`): the `pearson_banksy` arm above, written as obs
+  `bin_leiden`, beside the transferred `leiden`.
+
+Results, scored by `output/umap_islands/pearson_rerun/score.py` against the
+log-normalised labels saved just before the rerun:
+
+| | Old (log, 2000 seurat HVGs) | New (Pearson, 3000 HVGs) |
+|---|---|---|
+| Median HVG counts per cell | 62 | 139 |
+| Cell clusters, sample_id / patient_id | 16 / 15 | 21 / 20 |
+| ARI new vs old, sample_id / patient_id | – | 0.41 / 0.46 |
+| NMI vs Azimuth broad_cell_type (sample_id) | 0.372 | 0.376 |
+| Cell kNN graph components | 1 | 1 |
+| Median HVG counts per 8 um / 16 um bin | 8 / 15 | 16 / 34 |
+
+**Cells.** The new clusters split rather than reshuffle the old ones. New
+small clusters that are recognisable types:
+
+- plasma cells (IGKC, IGHG1, JCHAIN)
+- hair shaft cortex (KRTAP genes, 70 cells)
+- two sebaceous clusters (FASN, FADS2, MGST1)
+- eccrine glands (DCD, SCGB2A2, MUCL1, 167 cells)
+- lymphatic endothelium (CCL21, PROX1, MMRN1)
+- Schwann cells (MPZ, MBP)
+- a TYRP1+ basal cluster (KRT14, COL17A1, TYRP1, KIT), as in the HVG-flavour
+  comparison
+
+Mast cells did not separate at resolution 0.5: CPA3 peaks in the myeloid
+cluster (CD74, LYZ). One cluster of 10 cells (sample_id run, cluster 7) carries
+colonic epithelium markers (PIGR, FABP1, GUCA2A, CEACAM5) and is 100% one
+sample. It is likely carry-over or contamination, not skin. Integration is
+slightly less even than before, because rare structures now get their own
+clusters. In the sample_id run, three clusters exceed 70% one sample: the
+colonic 10, hair shaft 70 (81%) and eccrine 167 (71%). In the patient_id run
+no cluster exceeds 76%.
+
+**8 um `bin_leiden`.** 270,656 of 350,892 bins (77%) pass the 25-count floor;
+the rest are `unassigned`. The other scores match the `pearson_banksy` arm:
+
+- 16 clusters, the largest 23% of bins.
+- ARI 0.45 and NMI 0.59 against the transferred cell labels.
+- Log-depth Spearman 0.37 on embedding dimensions 1–5.
+- Two single-sample clusters: 93 bins (100%) and 2,271 bins (89%).
+- In the patient_id run, no cluster exceeds 46% one patient.
+
+Most clusters are 50–99% one cell cluster (`bin_leiden_clusters.csv`).
+
+**16 um domains.** Pearson residuals here were not tested before the switch.
+There are now 18 domains in the sample_id run. Six of them are 100% one sample
+and small: 11–278 bins, 590 in all, 0.5% of bins. Before the switch, three
+domains were under 50 bins and one had 512 bins. If they matter,
+`normalization_per_level: {square_016um: log}` restores the log-based features
+for that level.
+
 ## Why segmented cells work
 
-- **Depth.** Cells carry about four times the HVG counts of a 16 um bin, and
-  only 2 of 52,203 have none. The embedding is organised by expression rather
+- **Depth.** Cells carry about four times the HVG counts of a 16 um bin (139
+  against 34 with 3000 Pearson HVGs), and none have zero. The embedding is organised by expression rather
   than detection.
 - **Integration holds.** The cell kNN graph is a single component in both runs.
-  In the sample_id run, no single sample makes up more than 27% of any cluster,
-  except one cluster of 290 cells (50%). The condition difference survives: in
+  In the 2026-10-06 sample_id run, no single sample made up more than 27% of any
+  cluster, except one cluster of 290 cells (50%). The Pearson run has three
+  small exceptions (see above). The condition difference survives: in
   some clusters up to 64% of cells come from one condition, rather than every
   cluster being 50/50.
-- **Clusters are cell types.** The cell UMAP has 16 clusters in the sample_id
-  run (15 in patient_id). Its small outlying groups are recognisable cell
+- **Clusters are cell types.** The cell UMAP has 21 clusters in the sample_id
+  run (20 in patient_id; 16 and 15 before the Pearson switch). Its small outlying groups are recognisable cell
   types, not artefacts: smooth muscle (MYH11, DES, TAGLN), inner root sheath
   (TCHH, KRT71, KRT25), hair shaft cortex (KRTAP genes) and cornified
   keratinocytes (FLG, LOR, LCE).
@@ -285,9 +357,12 @@ downstream rules read:
   which pools about a cell's worth of counts. That pooled signal is enough to
   run PCA, Harmony and Leiden, and gives `domain`. Settings are in
   `squidpy.domains`.
-- **Expression unchanged.** Bins still go through the same normalise / HVG /
-  scale step, so SVG, CCC and DE see the same `X` and `.raw` as before. Only
-  the origin of the labels changed.
+- **Direct 8 um clusters.** `bin_leiden` (see Current recipe). It describes
+  ~40 um neighbourhoods; use the transferred `leiden` for cell identity.
+- **Expression.** Bins go through the same normalise / HVG / residual step as
+  cells. `X` holds the Pearson residuals of the 3000 HVGs, which SVG (Moran's I)
+  and CCC read. `.raw` and `layers['counts']`, read by markers and DE, are
+  unchanged.
 
 ## Caveats
 
@@ -297,10 +372,12 @@ downstream rules read:
 - 13% of in-cell 2 um squares belong to cells removed by cell-level QC; those
   areas count as uncovered.
 - A few domains come almost entirely from one sample or one patient. In the
-  sample_id run, domains 4, 10 and 14 are each under 50 bins, and domain 5
-  has 512 bins, 97% from one sample. In the patient_id run, domain 7 has 583
-  bins, 99.8% from one patient. Treat these as sample-specific regions, not
-  shared tissue types.
+  Pearson sample_id run, six domains of 11–278 bins (590 in all) are 100% one
+  sample. In the patient_id run, two domains (8 and 948 bins) are 100% one
+  patient. Treat these as sample-specific regions, not shared tissue types.
+- CCC (`li.mt.cellchat`, `use_raw=False`) reads `X`, which holds residuals now
+  and held scaled log values before; neither is the log-normalised input
+  LIANA expects.
 - Segmentation quality now sets the ceiling on cell-type resolution. Cells
   are segmented from H&E, and dense regions such as the epidermis can merge
   neighbouring nuclei.
@@ -312,6 +389,9 @@ downstream rules read:
 - Label transfer per capture area:
   `results/squidpy/{square_016um,square_008um}/qc*/label_transfer.csv`.
 - Domain composition: `results/squidpy/square_016um/qc*/domain_by_*.csv`.
+- 8 um `bin_leiden` composition:
+  `results/squidpy/square_008um/qc*/bin_leiden_by_*.csv`; the rerun scoring and
+  old labels: `output/umap_islands/pearson_rerun/`.
 - Spatial panels with leiden, domain and cell type side by side:
   `results/squidpy/square_016um/spatial/*_panels.pdf`.
 - The island investigation (scripts, tables, highlighted UMAPs) and the

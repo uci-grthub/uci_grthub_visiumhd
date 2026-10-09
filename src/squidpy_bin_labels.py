@@ -34,6 +34,14 @@ weighted ``sqrt(1 - lambda)`` and ``sqrt(lambda)``, then PCA, Harmony on the sam
 batch key as the cell run, kNN and Leiden. Averaging ~25 bins at two rings gives each
 bin roughly a cell's worth of counts, which is what makes it integrable when single
 bins are not.
+
+With ``--bin-cluster``, bins are also clustered directly into ``bin_leiden`` by the same
+BANKSY recipe in its cell-typing setting (lambda 0.2, so the bin's own expression
+dominates), on bins with at least ``--bin-cluster-min-counts`` counts; shallower bins
+are ``unassigned``. With ``--normalization pearson`` both recipes join SCTransform-style
+Pearson residuals rather than scaled log-normalised expression. This is the 8 um recipe
+that agreed best with the cell clusters in docs/clustering_level.md; it describes
+~40 um neighbourhoods, so the transferred ``leiden`` stays the cell-identity label.
 """
 
 import argparse
@@ -96,61 +104,90 @@ def as_category(values, cell_categories):
     return pd.Categorical(values, categories=categories)
 
 
-def neighbourhood_domains(adata, batch_key, library_key, n_rings, lam, n_pcs,
-                          n_neighbors, resolution, theta, crosstab_dir, cluster_key):
-    """BANKSY-style domains: own plus neighbourhood-mean expression, integrated, Leiden.
+def standardise(x):
+    """Centre and scale each column to unit variance, clipped at 10 like sc.pp.scale."""
+    x = x - x.mean(axis=0)
+    std = x.std(axis=0)
+    std[std == 0] = 1
+    return np.clip(x / std, -10, 10).astype(np.float32)
 
-    Expects ``adata`` as ``preprocess`` leaves it: scaled HVGs in X, log-normalised
-    counts for every gene in ``.raw``. Writes obs['domain'] and obsm['X_domain_pca'].
+
+def neighbourhood_domains(adata, batch_key, library_key, n_rings, lam, n_pcs,
+                          n_neighbors, resolution, theta, crosstab_dir, cluster_key,
+                          key="domain", min_counts=0):
+    """BANKSY-style clusters: own plus neighbourhood-mean expression, integrated, Leiden.
+
+    Expects ``adata`` as ``preprocess`` leaves it: scaled HVGs or Pearson residuals in X
+    (``uns['normalization']``), log-normalised counts for every gene in ``.raw``. With
+    log normalisation the neighbourhood mean is taken over log-normalised counts; with
+    Pearson it is taken over the residuals, and both halves are standardised. Only bins
+    with ``total_counts >= min_counts`` are clustered; the rest are unassigned. Writes
+    obs[key] and obsm['X_<key>_pca'].
     """
     import squidpy as sq
 
+    pearson = adata.uns.get("normalization") == "pearson"
+    full = adata
+    if min_counts:
+        mask = (adata.obs["total_counts"] >= min_counts).to_numpy()
+        print(f"{key}: clustering the {int(mask.sum())} of {adata.n_obs} bins with at "
+              f"least {min_counts} counts")
+        adata = adata[mask]
     graph_holder = sc.AnnData(obs=adata.obs[[library_key]].copy(),
                               obsm={"spatial": adata.obsm["spatial"]})
     sq.gr.spatial_neighbors(graph_holder, library_key=library_key, coord_type="grid",
                             n_neighs=8, n_rings=n_rings)
     graph = graph_holder.obsp["spatial_connectivities"].tocsr().astype(np.float32)
     degree = np.asarray(graph.sum(axis=1)).ravel()
-    print(f"Domains: {n_rings}-ring grid neighbourhood, median {np.median(degree):.0f} "
+    print(f"{key}: {n_rings}-ring grid neighbourhood, median {np.median(degree):.0f} "
           f"neighbours per bin; {int((degree == 0).sum())} bins have none")
     degree[degree == 0] = 1
-    lognorm = adata.raw[:, adata.var_names].X
-    lognorm = sp.csr_matrix(lognorm, dtype=np.float32)
-    neighbour_mean = np.asarray((sp.diags(1 / degree) @ graph @ lognorm).todense())
-    neighbour_mean -= neighbour_mean.mean(axis=0)
-    std = neighbour_mean.std(axis=0)
-    std[std == 0] = 1
-    neighbour_mean = np.clip(neighbour_mean / std, -10, 10)
-
-    own = np.asarray(adata.X, dtype=np.float32)
+    smoother = sp.diags(1 / degree) @ graph
+    if pearson:
+        own = np.asarray(adata.X, dtype=np.float32)
+        neighbour_mean = standardise(np.asarray(smoother @ own, dtype=np.float32))
+        own = standardise(own)
+    else:
+        lognorm = adata.raw[:, adata.var_names].X
+        lognorm = sp.csr_matrix(lognorm, dtype=np.float32)
+        neighbour_mean = standardise(np.asarray((smoother @ lognorm).todense()))
+        own = np.asarray(adata.X, dtype=np.float32)
     features = np.hstack([np.sqrt(1 - lam) * own, np.sqrt(lam) * neighbour_mean])
     del neighbour_mean, own
 
     holder = sc.AnnData(X=features, obs=adata.obs[[batch_key]].copy())
+    del features
     sc.pp.pca(holder, n_comps=n_pcs, svd_solver="arpack")
     rep = integrate(holder, [batch_key], theta)
     sc.pp.neighbors(holder, n_neighbors=n_neighbors, use_rep=rep)
-    sc.tl.leiden(holder, resolution=resolution, key_added="domain", flavor="igraph",
+    sc.tl.leiden(holder, resolution=resolution, key_added=key, flavor="igraph",
                  n_iterations=2, directed=False, random_state=0)
-    adata.obs["domain"] = holder.obs["domain"].to_numpy()
-    adata.obs["domain"] = adata.obs["domain"].astype("category")
-    adata.obsm["X_domain_pca"] = holder.obsm[rep]
-    sizes = adata.obs["domain"].value_counts().sort_index()
-    print(f"{len(sizes)} domains at resolution {resolution} (lambda {lam}): "
-          f"{sizes.to_dict()}")
+
+    adata = full
+    labels = pd.Series(UNASSIGNED, index=adata.obs_names, dtype=object)
+    labels[holder.obs_names] = holder.obs[key].astype(str).to_numpy()
+    found = sorted(holder.obs[key].unique(), key=int)
+    categories = found + ([UNASSIGNED] if (labels == UNASSIGNED).any() else [])
+    adata.obs[key] = pd.Categorical(labels.to_numpy(), categories=categories)
+    embedding = np.full((adata.n_obs, holder.obsm[rep].shape[1]), np.nan, dtype=np.float32)
+    embedding[adata.obs_names.get_indexer(holder.obs_names)] = holder.obsm[rep]
+    adata.obsm[f"X_{key}_pca"] = embedding
+    sizes = holder.obs[key].value_counts().sort_index()
+    print(f"{len(sizes)} {key} clusters at resolution {resolution} (lambda {lam}, "
+          f"{n_neighbors} neighbours): {sizes.to_dict()}")
 
     if crosstab_dir:
         os.makedirs(crosstab_dir, exist_ok=True)
-        for key in (cluster_key, "broad_cell_type", "condition", batch_key, "core_id"):
-            if key not in adata.obs:
+        for other in (cluster_key, "broad_cell_type", "condition", batch_key, "core_id"):
+            if other not in adata.obs:
                 continue
-            path = os.path.join(crosstab_dir, f"domain_by_{key}.csv")
-            pd.crosstab(adata.obs["domain"], adata.obs[key],
+            path = os.path.join(crosstab_dir, f"{key}_by_{other}.csv")
+            pd.crosstab(adata.obs[key], adata.obs[other],
                         normalize="index").round(5).to_csv(path)
             print(f"Wrote {path}")
-        worst = pd.crosstab(adata.obs["domain"], adata.obs[batch_key],
+        worst = pd.crosstab(adata.obs[key], adata.obs[batch_key],
                             normalize="index").max(axis=1).sort_values(ascending=False)
-        print(f"Largest single-{batch_key} share per domain:")
+        print(f"Largest single-{batch_key} share per {key} cluster:")
         print(worst.round(3).head(10).to_string())
 
 
@@ -178,6 +215,9 @@ def main():
     parser.add_argument("--hvg-batch-key", default=None)
     parser.add_argument("--hvg-flavor", default="seurat",
                         choices=["seurat", "seurat_v3", "pearson_residuals"])
+    parser.add_argument("--normalization", default="log", choices=["log", "pearson"],
+                        help="X and the domain features: scaled log-normalised HVGs, "
+                             "or analytic Pearson residuals (SCTransform-style)")
     parser.add_argument("--library-key", default="run_id",
                         help="obs column the spatial graph is built within")
     parser.add_argument("--domains", action="store_true",
@@ -188,8 +228,18 @@ def main():
     parser.add_argument("--domain-n-pcs", type=int, default=30)
     parser.add_argument("--domain-n-neighbors", type=int, default=30)
     parser.add_argument("--domain-resolution", type=float, default=0.3)
+    parser.add_argument("--bin-cluster", action="store_true",
+                        help="also cluster bins directly (BANKSY cell-typing) into "
+                             "bin_leiden")
+    parser.add_argument("--bin-cluster-n-rings", type=int, default=2)
+    parser.add_argument("--bin-cluster-lambda", type=float, default=0.2)
+    parser.add_argument("--bin-cluster-n-pcs", type=int, default=30)
+    parser.add_argument("--bin-cluster-n-neighbors", type=int, default=100)
+    parser.add_argument("--bin-cluster-resolution", type=float, default=0.5)
+    parser.add_argument("--bin-cluster-min-counts", type=int, default=25,
+                        help="bins shallower than this are left unassigned")
     parser.add_argument("--theta", type=float, default=2.0,
-                        help="Harmony theta for the domain embedding")
+                        help="Harmony theta for the domain and bin_leiden embeddings")
     args = parser.parse_args()
 
     adata = sc.read_h5ad(args.input)
@@ -251,7 +301,7 @@ def main():
     # same X / .raw / PCA as a directly clustered bin object; every bin is kept, since
     # nothing here embeds them
     adata = preprocess(adata, args.n_top_genes, args.hvg_batch_key, min_hvg_counts=0,
-                       hvg_flavor=args.hvg_flavor)
+                       hvg_flavor=args.hvg_flavor, normalization=args.normalization)
 
     write_crosstabs(adata, args.cluster_key, [args.batch_key], args.crosstab_dir)
 
@@ -261,6 +311,14 @@ def main():
                               args.domain_n_pcs, args.domain_n_neighbors,
                               args.domain_resolution, args.theta, args.crosstab_dir,
                               args.cluster_key)
+
+    if args.bin_cluster:
+        neighbourhood_domains(adata, args.batch_key, args.library_key,
+                              args.bin_cluster_n_rings, args.bin_cluster_lambda,
+                              args.bin_cluster_n_pcs, args.bin_cluster_n_neighbors,
+                              args.bin_cluster_resolution, args.theta, args.crosstab_dir,
+                              args.cluster_key, key="bin_leiden",
+                              min_counts=args.bin_cluster_min_counts)
 
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
     adata.write_h5ad(args.output, compression="gzip")

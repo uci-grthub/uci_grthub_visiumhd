@@ -148,7 +148,9 @@ squidpy:
       # interior under 10 counts, against 0.26 for the next section down.
       interior_median_counts: 20
   cluster:
-    n_top_genes: 2000
+    # 3000, SCTransform's default and the count tested at 8 um (compare_8um): with
+    # Pearson-residual selection a median 8 um bin then holds 28 HVG counts.
+    n_top_genes: 3000
     n_pcs: 30
     # 30 rather than scanpy's default 15: at 15 the kNN graph broke into 13 connected
     # components, and Leiden returns at least one cluster per component, so ~40 clusters
@@ -201,9 +203,14 @@ squidpy:
     # pearson_residuals (raw counts). seurat's 2000 genes hold 11% of cell counts;
     # pearson_residuals holds 19% and also separated mast cells and a TYRP1+ basal
     # cluster in a 2026-10-08 comparison (output/umap_islands/hvg_flavor_cells/).
-    # Only the selection changes; normalisation, scaling and PCA stay log-based.
-    hvg_flavor: "seurat"
+    hvg_flavor: "pearson_residuals"
     hvg_flavor_per_level: {}
+    # What PCA sees: log (log-normalised HVGs scaled to unit variance) or pearson
+    # (SCTransform-style analytic Pearson residuals of the raw HVG counts, theta 100,
+    # depth from all genes). Applies to the cell clustering and to every bin level's
+    # X, domains and bin_leiden. .raw stays log-normalised for markers and DE.
+    normalization: "pearson"
+    normalization_per_level: {}
     # Drop bins with fewer raw counts than this across the selected HVGs, before scaling.
     # A bin with no HVG counts scales to one shared row, so all such bins sit on a single
     # PCA point; Harmony offsets it once per batch and UMAP draws each copy as an island
@@ -242,6 +249,22 @@ squidpy:
     n_pcs: 30
     n_neighbors: 30
     resolution: 0.3     # domains are coarse; raise for finer regions
+  # Direct bin clustering, beside the labels transferred from cells: BANKSY in its
+  # cell-typing setting (lambda 0.2), each bin's Pearson residuals joined to the mean of
+  # two rings of neighbours (24 bins), PCA, Harmony on the cell run's batch key, kNN and
+  # Leiden. Written as obs "bin_leiden"; bins under min_counts are "unassigned". At
+  # 8 um this agreed best with the cell clusters of four recipes (ARI 0.44, against
+  # 0.17 for log-normalised bins; docs/clustering_level.md), but its clusters are
+  # ~40 um neighbourhoods, so the transferred "leiden" stays the cell-identity label.
+  bin_clustering:
+    enabled: true
+    levels: ["square_008um"]
+    n_rings: 2
+    lambda: 0.2
+    n_pcs: 30
+    n_neighbors: 100    # as for the 8 um graph sweep; 30 leaves it in pieces
+    resolution: 0.5
+    min_counts: 25      # keeps 77% of 8 um bins after section QC
   spatial:
     coord_type: "grid"
     n_neighs: 8           # Moore neighbourhood on the HD square lattice, not hex 6

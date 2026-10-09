@@ -19,7 +19,7 @@ import scanpy as sc
 import squidpy as sq
 
 #: obs columns worth a panel, when present.
-DEFAULT_KEYS = ("leiden", "domain", "core_id", "condition", "timepoint_weeks",
+DEFAULT_KEYS = ("leiden", "domain", "bin_leiden", "core_id", "condition", "timepoint_weeks",
                 "broad_cell_type", "total_counts")
 
 

@@ -57,9 +57,32 @@ UMAP_KEYS = ("sample_id", "run_id", "condition", "timepoint_weeks", "patient",
 CROSSTAB_KEYS = ("condition", "timepoint_weeks", "run_id", "core_id", "patient")
 
 
+def pearson_residuals(counts, depth, theta=100.0, chunk=20000):
+    """Analytic Pearson residuals (Lause et al. 2021) of ``counts`` as dense float32.
+
+    The SCTransform model with one overdispersion for every gene: mu = depth x gene
+    share, residual = (x - mu) / sqrt(mu + mu^2 / theta), clipped to +-sqrt(n_obs).
+    ``depth`` is each observation's total over *all* genes, which scanpy's
+    ``normalize_pearson_residuals`` cannot use once the object is cut to HVGs.
+    """
+    import scipy.sparse as sp
+
+    counts = sp.csr_matrix(counts)
+    depth = np.asarray(depth, dtype=np.float64)
+    share = np.asarray(counts.sum(axis=0)).ravel() / depth.sum()
+    clip = np.sqrt(counts.shape[0])
+    out = np.empty(counts.shape, dtype=np.float32)
+    for start in range(0, counts.shape[0], chunk):
+        stop = min(start + chunk, counts.shape[0])
+        mu = depth[start:stop, None] * share[None, :]
+        x = counts[start:stop].toarray()
+        out[start:stop] = np.clip((x - mu) / np.sqrt(mu + mu ** 2 / theta), -clip, clip)
+    return out
+
+
 def preprocess(adata, n_top_genes, batch_key, min_hvg_counts=1, report_key="sample_id",
-               hvg_flavor="seurat"):
-    """Normalise, log, select HVGs and run PCA. Raw counts stay in layers['counts'].
+               hvg_flavor="seurat", normalization="log"):
+    """Normalise, select HVGs and run PCA. Raw counts stay in layers['counts'].
 
     ``batch_key`` is the HVG batch, which is None by default and is *not* the Harmony
     batch: per-batch selection lets a near-empty section contribute noise genes to the
@@ -76,8 +99,13 @@ def preprocess(adata, n_top_genes, batch_key, min_hvg_counts=1, report_key="samp
     counts, a median of 62 per cell. ``pearson_residuals`` and ``seurat_v3`` rank on raw
     counts and hold 19-20% (107 and 78 per cell), and on 2026-10-08 Pearson residuals also
     resolved mast cells and a TYRP1+ basal cluster (output/umap_islands/hvg_flavor_cells/).
-    The selection is the only change: normalisation, scaling and PCA stay log-based.
     ``seurat_v3`` needs scikit-misc, which envs/squidpy does not carry.
+
+    ``normalization`` sets what PCA sees. ``log``: log-normalised HVGs scaled to unit
+    variance. ``pearson``: SCTransform-style analytic Pearson residuals of the raw HVG
+    counts (``pearson_residuals``), which models depth instead of dividing it out, so
+    shallow bins are not inflated by log1p of small numbers. Either way ``.raw`` holds
+    the log-normalised counts of every gene for markers, DE and plots.
     """
     if "counts" not in adata.layers:
         adata.layers["counts"] = adata.X.copy()
@@ -100,9 +128,11 @@ def preprocess(adata, n_top_genes, batch_key, min_hvg_counts=1, report_key="samp
     print(f"HVG flavor: {hvg_flavor}; batch_key: {batch_key or 'none (whole object)'}")
     print(f"{int(adata.var['highly_variable'].sum())} highly variable genes")
 
+    depth = np.asarray(adata.layers["counts"].sum(axis=1)).ravel()
     adata = adata[:, adata.var["highly_variable"]].copy()
 
     hvg_counts = np.asarray(adata.layers["counts"].sum(axis=1)).ravel()
+    print(f"median {np.median(hvg_counts):.0f} HVG counts per observation")
     keep = hvg_counts >= min_hvg_counts
     print(f"min_hvg_counts {min_hvg_counts}: dropping {int((~keep).sum())} of "
           f"{adata.n_obs} bins ({(~keep).mean():.4f}) with too few HVG counts")
@@ -111,7 +141,14 @@ def preprocess(adata, n_top_genes, batch_key, min_hvg_counts=1, report_key="samp
         print(f"  dropped by {report_key}: {dropped[dropped > 0].to_dict()}")
     adata = adata[keep].copy()
 
-    sc.pp.scale(adata, max_value=10)
+    if normalization == "pearson":
+        adata.X = pearson_residuals(adata.layers["counts"], depth[keep])
+        print(f"PCA on Pearson residuals (theta 100, clip "
+              f"{np.sqrt(adata.n_obs):.0f}) of {adata.n_vars} HVGs")
+    else:
+        sc.pp.scale(adata, max_value=10)
+        print(f"PCA on scaled log-normalised {adata.n_vars} HVGs")
+    adata.uns["normalization"] = normalization
     sc.pp.pca(adata, n_comps=50, svd_solver="arpack")
     return adata
 
@@ -241,6 +278,9 @@ def main():
     parser.add_argument("--hvg-flavor", default="seurat",
                         choices=["seurat", "seurat_v3", "pearson_residuals"],
                         help="how HVGs are ranked; seurat_v3 needs scikit-misc")
+    parser.add_argument("--normalization", default="log", choices=["log", "pearson"],
+                        help="PCA input: scaled log-normalised HVGs, or analytic "
+                             "Pearson residuals (SCTransform-style)")
     parser.add_argument("--min-hvg-counts", type=int, default=1,
                         help="drop bins with fewer raw counts than this across the HVGs; "
                              "bins with none collapse to one point and form UMAP islands")
@@ -265,7 +305,8 @@ def main():
         print(f"Subsampled to {adata.n_obs} bins")
 
     adata = preprocess(adata, args.n_top_genes, args.hvg_batch_key,
-                       args.min_hvg_counts, args.batch_key[0], args.hvg_flavor)
+                       args.min_hvg_counts, args.batch_key[0], args.hvg_flavor,
+                       args.normalization)
 
     use_rep = "X_pca"
     if args.use_harmony:
